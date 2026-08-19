@@ -1,9 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { SelectList } from "@earendil-works/pi-tui";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
-import { agents, isAgentName } from "./agents";
+import { isSubagent } from "../env";
+import { agentDirectory, agents, isAgentName } from "./agents";
 import { Runner, type Job } from "./runner";
 
 const action = Type.Optional(
@@ -17,6 +18,8 @@ const action = Type.Optional(
 );
 const SUBAGENT_RESULT = "__45degree_subagent_result";
 const SUBAGENT_RESULT_RE = /^Background subagent finished:/;
+const STATUS_ID = "45degree-subagents";
+let ui: ExtensionUIContext | undefined;
 
 const parameters = Type.Object({
   action,
@@ -54,18 +57,26 @@ function jobText(job: Job): string {
   return `id: ${job.id}\nagent: ${job.agent}\nstatus: ${job.status}\nelapsed: ${elapsed}${session}\nresult:\n${result}`;
 }
 
-function agentDirectory(): string {
-  return Object.entries(agents)
-    .map(([name, definition]) => `- ${name}: ${definition.description}`)
-    .join("\n");
-}
-
 export default function setupSubagents(pi: ExtensionAPI): void {
-  if (process.env.PI_45DEGREE_SUBAGENT === "1") return;
+  if (isSubagent()) return;
   const runner = new Runner();
 
-  pi.on("session_shutdown", () => runner.shutdown());
+  function updateStatus(): void {
+    if (!ui) return;
+    const running = runner.list().filter((job) => job.status === "running");
+    if (!running.length) {
+      ui.setStatus(STATUS_ID, undefined);
+      return;
+    }
+    ui.setStatus(STATUS_ID, `subagents: ${running.map((job) => job.agent).join(", ")}`);
+  }
+
+  pi.on("session_shutdown", () => {
+    ui?.setStatus(STATUS_ID, undefined);
+    runner.shutdown();
+  });
   runner.onFinished((job) => {
+    updateStatus();
     if (!job.background) return;
     void pi.sendMessage(
       {
@@ -165,6 +176,8 @@ export default function setupSubagents(pi: ExtensionAPI): void {
         ctx.cwd,
         params.async === true,
       );
+      ui = ctx.ui;
+      updateStatus();
       if (params.async)
         return { content: [{ type: "text", text: jobText(job) }] };
       if (signal.aborted) runner.cancel(job.id);

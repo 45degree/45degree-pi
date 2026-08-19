@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentDefinition, AgentName } from "./agents";
+import { subagentEnv } from "../env";
 
 export type JobStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -64,9 +65,7 @@ export class Runner {
         detached: process.platform !== "win32",
         env: {
           ...process.env,
-          PI_45DEGREE_SUBAGENT: "1",
-          PI_45DEGREE_AGENT: agent,
-          PI_45DEGREE_PARENT_PID: String(process.pid),
+          ...subagentEnv(agent, process.pid),
         },
         stdio: ["ignore", "pipe", "pipe"],
       },

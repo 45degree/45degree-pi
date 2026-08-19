@@ -17,6 +17,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import type { ServerEntry } from "../node_modules/pi-mcp-adapter/types.ts";
 import { config } from "./config.ts";
+import { isSubagent, subagentName } from "./env.ts";
 
 function loadSecrets(): Record<string, string> {
   return JSON.parse(readFileSync(join(getAgentDir(), "security.json"), "utf8"));
@@ -35,9 +36,8 @@ function matches(name: string, patterns: string[]): boolean {
 }
 
 const cfg = config.mcp;
-const subagent = process.env.PI_45DEGREE_SUBAGENT === "1";
-const patterns = subagent
-  ? (cfg.agents[process.env.PI_45DEGREE_AGENT ?? ""] ?? [])
+const patterns = isSubagent()
+  ? (cfg.agents[subagentName() ?? ""] ?? [])
   : cfg.session;
 
 const allServers: Record<string, ServerEntry> = {
