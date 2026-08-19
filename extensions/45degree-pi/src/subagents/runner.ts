@@ -35,7 +35,6 @@ export class Runner {
     definition: AgentDefinition,
     task: string,
     cwd: string,
-    model?: string,
     background = false,
   ): Job {
     const sessionDir = join(tmpdir(), "45degree-pi-subagents", randomUUID());
@@ -52,9 +51,10 @@ export class Runner {
       definition.thinking,
       "--system-prompt",
       definition.prompt,
-      task,
     ];
-    if (model) args.splice(1, 0, "--model", model);
+    for (const skillPath of definition.skills ?? []) args.push("--skill", skillPath);
+    args.push(task);
+    if (definition.model) args.splice(1, 0, "--model", definition.model);
 
     const child = spawn(
       process.execPath,
@@ -65,6 +65,7 @@ export class Runner {
         env: {
           ...process.env,
           PI_45DEGREE_SUBAGENT: "1",
+          PI_45DEGREE_AGENT: agent,
           PI_45DEGREE_PARENT_PID: String(process.pid),
         },
         stdio: ["ignore", "pipe", "pipe"],

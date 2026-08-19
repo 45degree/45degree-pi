@@ -22,7 +22,6 @@ const parameters = Type.Object({
   action,
   agent: Type.Optional(Type.String()),
   task: Type.Optional(Type.String()),
-  model: Type.Optional(Type.String()),
   async: Type.Optional(Type.Boolean()),
   id: Type.Optional(Type.String()),
 });
@@ -53,6 +52,12 @@ function jobText(job: Job): string {
       ? job.output || "(no output)"
       : job.error || job.status;
   return `id: ${job.id}\nagent: ${job.agent}\nstatus: ${job.status}\nelapsed: ${elapsed}${session}\nresult:\n${result}`;
+}
+
+function agentDirectory(): string {
+  return Object.entries(agents)
+    .map(([name, definition]) => `- ${name}: ${definition.description}`)
+    .join("\n");
 }
 
 export default function setupSubagents(pi: ExtensionAPI): void {
@@ -109,12 +114,12 @@ export default function setupSubagents(pi: ExtensionAPI): void {
     label: "Subagent",
     description:
       "Delegate a focused task to a specialist. Background completion automatically resumes the main agent with the result.",
-    promptSnippet:
-      "Delegate focused work to explorer, librarian, observer, oracle, fixer, or designer.",
+    promptSnippet: `Delegate focused work using \`subagent\` to one of these specialists:\n${agentDirectory()}`,
     promptGuidelines: [
       "Use subagent for focused independent work; choose the narrowest specialist.",
-      "Use async: true for independent work. Its completion automatically resumes you with the result.",
-      "Do not use subagent for council, recursive delegation, or work requiring a child to outlive this session.",
+      "Use async: true for independent work. Background completion automatically resumes you with the result.",
+      "Use action: status, result, cancel, or session with the subagent id to inspect or control an existing task.",
+      "Do not use subagent recursively or for work requiring a child to outlive this session.",
     ],
     parameters,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -153,15 +158,11 @@ export default function setupSubagents(pi: ExtensionAPI): void {
       }
       if (!params.task?.trim())
         return { content: [{ type: "text", text: "task is required" }] };
-      const model =
-        params.model ??
-        (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
       const job = runner.start(
         params.agent,
         agents[params.agent],
         params.task,
         ctx.cwd,
-        model,
         params.async === true,
       );
       if (params.async)

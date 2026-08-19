@@ -1,10 +1,31 @@
 export type AgentName = "explorer" | "librarian" | "observer" | "oracle" | "fixer" | "designer";
 
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { config, type AgentOverrides } from "../config.ts";
+
 export interface AgentDefinition {
   description: string;
   tools: string[];
+  /** Absolute paths of skill directories granted to this agent. Empty = no skills. */
+  skills?: string[];
   thinking: "low" | "medium" | "high";
+  model?: string;
   prompt: string;
+}
+
+/** Apply static `config.agents.<name>` overrides on top of the built-in defaults. */
+function withOverrides(def: AgentDefinition, o?: AgentOverrides): AgentDefinition {
+  if (!o) return def;
+  return {
+    ...def,
+    ...(o.tools !== undefined && { tools: o.tools }),
+    ...(o.skills !== undefined && {
+      skills: o.skills.map((p) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p)),
+    }),
+    ...(o.thinking !== undefined && { thinking: o.thinking }),
+    ...(o.model !== undefined && { model: o.model }),
+  };
 }
 
 const readonlyRules = `
@@ -15,7 +36,7 @@ File operation rules:
 - Do not spawn subagents or delegate work.
 `;
 
-export const agents: Record<AgentName, AgentDefinition> = {
+const defaults: Record<AgentName, AgentDefinition> = {
   explorer: {
     description: "Fast codebase search and pattern matching: find files, symbols, and relevant implementation details.",
     tools: ["read", "grep", "find", "ls", "bash"],
@@ -35,7 +56,7 @@ ${readonlyRules}`,
   },
   librarian: {
     description: "Research official documentation, external libraries, GitHub examples, and current web information.",
-    tools: ["read", "grep", "find", "ls", "bash", "mcp:context7", "mcp:gh_grep", "mcp:tavily"],
+    tools: ["read", "grep", "find", "ls", "bash", "mcp", "mcpScript"],
     thinking: "low",
     prompt: `You are Librarian, a documentation and external-research specialist.
 
@@ -78,6 +99,15 @@ Implement the requested change efficiently. Inspect the repository as needed, ma
 Handle layout, styling, responsive behavior, component visual hierarchy, accessibility, and polish. Inspect existing conventions before changing code. Implement coherent visual changes rather than merely describing them, and validate when practical. Do not delegate work. End with a concise summary of the user-visible result and changed files.`,
   },
 };
+
+// Built-in defaults, overridden per-agent by static config.agents.<name>.
+const overrides = config.agents;
+export const agents = Object.fromEntries(
+  (Object.entries(defaults) as [AgentName, AgentDefinition][]).map(([name, def]) => [
+    name,
+    withOverrides(def, overrides?.[name]),
+  ]),
+) as Record<AgentName, AgentDefinition>;
 
 export function isAgentName(value: string): value is AgentName {
   return value in agents;

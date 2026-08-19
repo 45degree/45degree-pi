@@ -1,8 +1,9 @@
 {
   "lastChangelogVersion": "0.84.2",
   "theme": "dark",
-  "packages": [],
+  "packages": ["npm:pi-zentui"],
   "extensions": [],
   "defaultProvider": "omniroute",
-  "defaultModel": "omos-orchestrator"
+  "defaultModel": "omos-orchestrator",
+  "defaultThinkingLevel": "xhigh"
 }

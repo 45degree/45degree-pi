@@ -12,6 +12,8 @@ import magicContext from "@cortexkit/pi-magic-context";
 import retryErrors from "./src/retry";
 import omnirouteAuth from "./src/omniroute/auth";
 import mcpFactory from "./src/mcp";
+import setupOrchestratorPrompt from "./src/orchestrator-prompt";
+import setupSkills from "./src/skills";
 import setupSubagents from "./src/subagents/index";
 
 export default function customPi(pi: ExtensionAPI): void {
@@ -19,5 +21,7 @@ export default function customPi(pi: ExtensionAPI): void {
   omnirouteAuth(pi);
   magicContext(pi);
   mcpFactory(pi);
+  setupOrchestratorPrompt(pi);
+  setupSkills(pi);
   setupSubagents(pi);
 }
