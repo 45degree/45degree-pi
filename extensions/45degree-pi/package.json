@@ -1,0 +1,16 @@
+{
+  "name": "custom-pi",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cortexkit/pi-magic-context": "^0.38.0",
+    "pi-mcp-adapter": "^2.26.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

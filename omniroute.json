@@ -1,0 +1,4 @@
+{
+  "baseURL": "https://omniroute.45degree.icu",
+  "excludeProviders": ["no-think"]
+}

@@ -1,0 +1,8 @@
+{
+  "lastChangelogVersion": "0.84.2",
+  "theme": "dark",
+  "packages": [],
+  "extensions": [],
+  "defaultProvider": "omniroute",
+  "defaultModel": "omos-orchestrator"
+}
