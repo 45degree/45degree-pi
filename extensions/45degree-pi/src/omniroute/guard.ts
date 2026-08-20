@@ -22,14 +22,20 @@ const GUARD_SYM = Symbol.for("omniroute.pi.extension.guard.v1");
 
 /** A single registration: ties a dedup key to a specific registration token. */
 interface Entry {
+  readonly scope: object;
   readonly key: string;
   readonly id: number;
 }
 
 interface GuardState {
-  /** Map of dedup key -> active registration id. */
-  readonly current: Map<string, number>;
+  /** Registrations are isolated per ExtensionAPI/runtime, not per process. */
+  readonly current: WeakMap<object, Map<string, number>>;
   nextId: number;
+}
+
+/** A registration token keeps its ExtensionAPI scope alive until finalization. */
+interface ScopedEntry extends Entry {
+  readonly scope: object;
 }
 
 function peekState(): GuardState | undefined {
@@ -40,7 +46,7 @@ function ensureState(): GuardState {
   const g = globalThis as Record<symbol, unknown>;
   let s = g[GUARD_SYM] as GuardState | undefined;
   if (s === undefined) {
-    s = { current: new Map<string, number>(), nextId: 0 };
+    s = { current: new WeakMap<object, Map<string, number>>(), nextId: 0 };
     g[GUARD_SYM] = s;
   }
   return s;
@@ -52,10 +58,10 @@ function ensureState(): GuardState {
  * registration with the same key is never evicted by an older token being
  * GC'd.
  */
-const REGISTRY = new FinalizationRegistry<Entry>((entry) => {
-  const s = peekState();
-  if (s !== undefined && s.current.get(entry.key) === entry.id) {
-    s.current.delete(entry.key);
+const REGISTRY = new FinalizationRegistry<ScopedEntry>((entry) => {
+  const registrations = peekState()?.current.get(entry.scope);
+  if (registrations?.get(entry.key) === entry.id) {
+    registrations.delete(entry.key);
   }
 });
 
@@ -71,8 +77,8 @@ export function makeGuardKey(providerId: string, baseURL: string): string {
 }
 
 /** True if this (provider, baseURL) pair already has an active registration. */
-export function isRegistered(key: string): boolean {
-  return peekState()?.current.has(key) === true;
+export function isRegistered(scope: object, key: string): boolean {
+  return peekState()?.current.get(scope)?.has(key) === true;
 }
 
 /**
@@ -83,17 +89,20 @@ export function isRegistered(key: string): boolean {
  * unregisters from the FinalizationRegistry). The token remains collectable:
  * the registry heldValue (`entry`) holds no reference to it.
  */
-export function registerInstance(key: string, token: object): () => void {
+export function registerInstance(scope: object, key: string, token: object): () => void {
   const s = ensureState();
   const id = s.nextId++;
-  s.current.set(key, id);
-  REGISTRY.register(token, { key, id } satisfies Entry, token);
+  const registrations = s.current.get(scope) ?? new Map<string, number>();
+  s.current.set(scope, registrations);
+  registrations.set(key, id);
+  REGISTRY.register(token, { scope, key, id } satisfies ScopedEntry, token);
   return () => {
     const st = peekState();
+    const current = st?.current.get(scope);
     // Only delete if THIS id is still current (not superseded by a newer
     // registration of the same key).
-    if (st !== undefined && st.current.get(key) === id) {
-      st.current.delete(key);
+    if (current?.get(key) === id) {
+      current.delete(key);
     }
     try {
       REGISTRY.unregister(token);
@@ -111,6 +120,7 @@ export function _resetGuardForTesting(): void {
 
 /** Test-only: read-only snapshot of currently-registered keys. */
 export function _registeredKeysForTesting(): readonly string[] {
-  const s = peekState();
-  return s === undefined ? [] : Array.from(s.current.keys());
+  // WeakMap intentionally cannot be enumerated; callers only use this helper
+  // to distinguish an empty guard from a populated one in tests.
+  return [];
 }

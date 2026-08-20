@@ -20,7 +20,7 @@ export default function customPi(pi: ExtensionAPI): void {
   retryErrors(pi);
   omnirouteAuth(pi);
   magicContext(pi);
-  mcpFactory(pi);
+  mcpFactory()(pi);
   setupOrchestratorPrompt(pi);
   setupSkills(pi);
   setupSubagents(pi);

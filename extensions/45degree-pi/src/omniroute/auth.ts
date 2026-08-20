@@ -47,9 +47,9 @@ export default function (pi: ExtensionAPI): void {
   // baseURL) registers nothing. The FinalizationRegistry in guard.ts clears
   // the entry when pi drops this factory's token (reload / rebind).
   const guardKey = makeGuardKey(resolved.providerId, resolved.baseURL);
-  if (isRegistered(guardKey)) return;
+  if (isRegistered(pi, guardKey)) return;
   const guardToken = { guard: true };
-  registerInstance(guardKey, guardToken);
+  registerInstance(pi, guardKey, guardToken);
 
   const provider = createProvider({
     id: resolved.providerId,

@@ -1,0 +1,243 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  ModelRuntime,
+  SessionManager,
+  type AgentSession,
+  type AgentSessionEvent,
+  type InlineExtension,
+} from "@earendil-works/pi-coding-agent";
+import magicContext from "@cortexkit/pi-magic-context";
+import omnirouteAuth from "../omniroute/auth.ts";
+import createMcpExtension from "../mcp.ts";
+import type { AgentDefinition, AgentName } from "./agents.ts";
+
+export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export interface JobEvent { type: "text" | "thinking" | "tool_start" | "tool_end" | "status"; text?: string; tool?: string; }
+export interface Job {
+  id: string;
+  agent: AgentName;
+  status: JobStatus;
+  startedAt: number;
+  output?: string;
+  activity?: string[];
+  error?: string;
+  background: boolean;
+  session?: AgentSession;
+  sessionId?: string;
+  sessionFile?: string;
+  done: Promise<void>;
+  /** Live activity state, tintinweb-style: tools currently running + response text. */
+  activeTools?: Map<string, string>;
+  responseText?: string;
+}
+export interface ManagerPolicy {
+  concurrency: () => number;
+  maxSessions: () => number;
+}
+const defaultPolicy: ManagerPolicy = {
+  concurrency: () => Math.min(8, Math.max(1, Number(process.env.PI_45DEGREE_SUBAGENT_CONCURRENCY) || 4)),
+  maxSessions: () => 50,
+};
+
+export class SubagentManager {
+  private readonly jobs = new Map<string, Job>();
+  private readonly queues = new Map<string, string[]>();
+  private readonly listeners = new Set<(job: Job, event: JobEvent) => void>();
+  private readonly sessionDir = join(tmpdir(), "45degree-pi-subagents");
+  private running = 0;
+  private shuttingDown = false;
+  private readonly policy: ManagerPolicy;
+
+  constructor(private readonly definitions: Record<AgentName, AgentDefinition>, policy: Partial<ManagerPolicy> = {}) {
+    this.policy = { ...defaultPolicy, ...policy };
+    mkdirSync(this.sessionDir, { recursive: true });
+  }
+
+  onEvent(listener: (job: Job, event: JobEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  list(): Job[] { return [...this.jobs.values()]; }
+  get(id: string): Job | undefined { return this.jobs.get(id); }
+
+  start(agent: AgentName, task: string, cwd: string, background = false): Job {
+    const job = this.makeJob(agent, background);
+    (job as Job & { cwd?: string; tasks?: string[] }).cwd = cwd;
+    (job as Job & { cwd?: string; tasks?: string[] }).tasks = [task];
+    this.jobs.set(job.id, job);
+    this.enqueue(job.id);
+    return job;
+  }
+
+  append(id: string, task: string): Job {
+    const job = this.jobs.get(id);
+    if (!job) throw new Error(`Unknown subagent id: ${id}`);
+    const internal = job as Job & { tasks: string[] };
+    internal.tasks.push(task);
+    if (job.status !== "running" && job.status !== "queued") {
+      // cancelled/failed/completed IDs stay reusable (Q16): requeue the same session.
+      this.resetDone(job);
+      job.status = "queued";
+      this.emit(job, { type: "status" });
+      this.enqueue(id);
+    }
+    return job;
+  }
+
+  async cancel(id: string): Promise<Job | undefined> {
+    const job = this.jobs.get(id);
+    if (!job) return undefined;
+    (job as Job & { tasks: string[] }).tasks.length = 0;
+    this.removeQueued(id);
+    const wasRunning = job.status === "running";
+    if (wasRunning) await job.session?.abort();
+    job.status = "cancelled";
+    if (!wasRunning) (job as Job & { resolve: () => void }).resolve();
+    this.emit(job, { type: "status" });
+    return job;
+  }
+
+  async waitForRunning(): Promise<void> {
+    // Q15: main session must not end before its subagents — wait for queued AND running.
+    await Promise.all(this.list().filter((job) => job.status === "running" || job.status === "queued").map((job) => job.done));
+  }
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    await Promise.all(this.list().map((job) => this.cancel(job.id)));
+    await this.waitForRunning();
+    for (const job of this.list()) job.session?.dispose();
+  }
+
+  private makeJob(agent: AgentName, background: boolean): Job {
+    let resolve!: () => void;
+    const done = new Promise<void>((r) => { resolve = r; });
+    return { id: randomUUID(), agent, status: "queued", startedAt: Date.now(), background, done, ...({ resolve } as object) } as Job;
+  }
+  private resetDone(job: Job): void {
+    let resolve!: () => void;
+    job.done = new Promise<void>((r) => { resolve = r; });
+    (job as Job & { resolve: () => void }).resolve = resolve;
+  }
+  private enqueue(id: string): void {
+    const job = this.jobs.get(id)!;
+    const queue = this.queues.get(id) ?? [];
+    if (!queue.includes(id)) queue.push(id);
+    this.queues.set(id, queue);
+    this.pump();
+  }
+  private removeQueued(id: string): void { this.queues.delete(id); }
+  private pump(): void {
+    while (!this.shuttingDown && this.running < this.policy.concurrency()) {
+      const id = [...this.queues.keys()].find((key) => this.queues.get(key)?.length);
+      if (!id) return;
+      this.queues.delete(id);
+      const job = this.jobs.get(id)!;
+      if (job.status !== "cancelled") void this.run(job);
+    }
+  }
+  private async run(job: Job): Promise<void> {
+    this.running++;
+    job.status = "running";
+    this.emit(job, { type: "status" });
+    try {
+      const internal = job as Job & { cwd: string; tasks: string[]; resolve: () => void };
+      if (!job.session) await this.createSession(job, internal.cwd);
+      while (internal.tasks.length && job.status !== "cancelled") {
+        const task = internal.tasks.shift()!;
+        await new Promise<void>((resolve, reject) => {
+          const off = job.session!.subscribe((event) => {
+            this.forward(job, event);
+            if (event.type === "agent_end") { off(); resolve(); }
+          });
+          void job.session!.sendUserMessage(task).catch((error) => { off(); reject(error); });
+        });
+      }
+      if (job.status !== "cancelled") job.status = "completed";
+    } catch (error) {
+      if (job.status !== "cancelled") { job.status = "failed"; job.error = error instanceof Error ? error.message : String(error); }
+    } finally {
+      this.running--;
+      this.emit(job, { type: "status" });
+      const internal = job as Job & { tasks: string[]; resolve: () => void };
+      internal.resolve();
+      this.evictIdle();
+      this.pump();
+    }
+  }
+  private async createSession(job: Job, cwd: string): Promise<void> {
+    this.evictIdle();
+    const definition = this.definitions[job.agent];
+    const [provider, ...modelId] = (definition.model ?? "").split("/");
+    const runtime = await ModelRuntime.create();
+    const loader = new DefaultResourceLoader({
+      cwd, agentDir: join(process.env.HOME ?? "", ".pi", "agent"), noExtensions: true,
+      noSkills: true, noPromptTemplates: true, noContextFiles: false,
+      additionalSkillPaths: definition.skills ?? [], systemPrompt: definition.prompt,
+      extensionFactories: [omnirouteAuth as InlineExtension, magicContext as InlineExtension, createMcpExtension(job.agent)],
+    });
+    await loader.reload();
+    // Inline providers register when AgentSession binds the extension runtime.
+    // Resolve after that binding, not before loader creation.
+    const { session } = await createAgentSession({
+      cwd, modelRuntime: runtime,
+      thinkingLevel: definition.thinking, tools: definition.tools,
+      excludeTools: ["subagent", "ctx_memory"], resourceLoader: loader,
+      sessionManager: SessionManager.create(cwd, this.sessionDir),
+    });
+    // Hosts normally emit session_start via bindExtensions; do the same so
+    // extension hooks (Magic Context retrieval, resource discovery) initialize.
+    try { await session.bindExtensions({}); } catch { /* non-fatal */ }
+    let model = modelId.length ? runtime.getModel(provider, modelId.join("/")) : undefined;
+    if (!model && modelId.length && provider) {
+      // Native-provider registration kicks an async stored-models restore
+      // (models-store.json); wait for it deterministically before resolving.
+      try { await runtime.refresh({ providers: [provider], allowNetwork: false }); } catch { /* best effort */ }
+      model = runtime.getModel(provider, modelId.join("/"));
+    }
+    if (definition.model && !model) {
+      session.dispose();
+      throw new Error(`Configured model is unavailable: ${definition.model}`);
+    }
+    if (model) session.setModel(model);
+    job.session = session; job.sessionId = session.sessionId; job.sessionFile = session.sessionFile ?? undefined;
+  }
+  private forward(job: Job, event: AgentSessionEvent): void {
+    const data = event as unknown as { type: string; assistantMessageEvent?: { type: string; delta?: string }; toolName?: string };
+    if (data.type === "message_update" && data.assistantMessageEvent?.delta) {
+      const type = data.assistantMessageEvent.type === "thinking_delta" ? "thinking" : data.assistantMessageEvent.type === "text_delta" ? "text" : undefined;
+      if (type) {
+        const activity = job.activity ??= [];
+        activity.push(data.assistantMessageEvent.delta);
+        if (activity.length > 200) activity.shift();
+        if (type === "text") { job.output = (job.output ?? "") + data.assistantMessageEvent.delta; job.responseText = job.output; }
+        this.emit(job, { type, text: data.assistantMessageEvent.delta });
+      }
+    }
+    if (data.type === "tool_execution_start" || data.type === "tool_execution_end") {
+      if (data.type === "tool_execution_start") {
+        const activity = job.activity ??= [];
+        activity.push(`\n[tool] ${data.toolName ?? "unknown"}\n`);
+        if (activity.length > 200) activity.shift();
+        (job.activeTools ??= new Map()).set(`${data.toolName}_${Date.now()}`, data.toolName ?? "unknown");
+      } else {
+        const tools = job.activeTools;
+        if (tools) for (const [key, name] of tools) { if (name === data.toolName) { tools.delete(key); break; } }
+      }
+      this.emit(job, { type: data.type === "tool_execution_start" ? "tool_start" : "tool_end", tool: data.toolName });
+    }
+  }
+  private emit(job: Job, event: JobEvent): void { for (const listener of this.listeners) listener(job, event); }
+  private evictIdle(): void {
+    const idle = this.list().filter((job) => job.status !== "running" && job.status !== "queued" && job.session).sort((a, b) => a.startedAt - b.startedAt);
+    while (this.list().filter((job) => job.session).length >= this.policy.maxSessions() && idle.length) {
+      const job = idle.shift()!;
+      job.session?.dispose(); job.session = undefined;
+      // Audit JSONL is deliberately kept: eviction releases the in-memory session only.
+    }
+  }
+}

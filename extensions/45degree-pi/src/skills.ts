@@ -2,9 +2,7 @@
  * Exposes the extension's bundled skills (skills/ directory) to sessions via
  * resources_discover, so they work without user-level discovery directories.
  *
- * Subagents are skipped: runner.ts spawns them with --no-skills plus explicit
- * --skill grants (OMO deny-by-default parity). Guarding here also covers
- * reload paths where updateSkillsFromPaths could bypass the noSkills check.
+ * Child sessions use a private resource loader with explicit skill grants.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";

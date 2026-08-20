@@ -4,3 +4,4 @@ security.json
 npm/
 models-store.json
 sessions/
+trust.json
