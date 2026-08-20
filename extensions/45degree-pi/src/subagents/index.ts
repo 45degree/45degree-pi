@@ -1,7 +1,8 @@
-import { DynamicBorder, getMarkdownTheme, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, SelectList, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { agentDirectory, agents, isAgentName } from "./agents.ts";
+import { openConversationViewer } from "./conversation-viewer.ts";
 import { SubagentManager, type Job } from "./manager.ts";
 
 const action = Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("status"), Type.Literal("result"), Type.Literal("cancel"), Type.Literal("session")]));
@@ -9,17 +10,14 @@ const parameters = Type.Object({ action, agent: Type.Optional(Type.String()), ta
 const SUBAGENT_RESULT = "__45degree_subagent_result";
 const SUBAGENT_RESULT_RE = /^Background subagent finished:/;
 const STATUS_ID = "45degree-subagents";
-const PREVIEW_ID = "45degree-subagent-preview";
-const SPINNER = ["⋮", "⁝", "︙", "⁝"];
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TOOL_ACTIVITY: Record<string, string> = { read: "reading", bash: "running command", edit: "editing", write: "writing", grep: "searching", find: "finding files", ls: "listing" };
-interface PreviewState { markdown: Markdown; root: Container; tui: { requestRender(): void }; }
+const MAX_WIDGET_LINES = 12;
 let ui: ExtensionUIContext | undefined;
-let watchedJob: Job | undefined;
-let preview: PreviewState | undefined;
 let spinnerFrame = 0;
 let widgetTimer: ReturnType<typeof setInterval> | undefined;
-
-// Tree of ALL agents, tintinweb-style: one row per active job, spinner + name + stats + activity.
+let lastStatus: string | undefined;
+const finishedTurnAge = new Map<string, number>();
 let fleetWidget: { tui: { requestRender(): void }; registered: boolean } | undefined;
 
 function toolActivity(job: Job): string {
@@ -33,8 +31,14 @@ function toolActivity(job: Job): string {
       groups.set(action, (groups.get(action) ?? 0) + 1);
     }
     const parts: string[] = [];
-    for (const [action, count] of groups) parts.push(count > 1 ? `${action} ×${count}` : action);
+    for (const [action, count] of groups) parts.push(count > 1 ? `${action} ${count} ${action === "searching" ? "patterns" : "files"}` : action);
     return parts.join(", ") + "…";
+  }
+  // A just-finished tool still describes current activity better than stale
+  // response text — the model usually pauses between tool end and next output.
+  if (job.lastTool) {
+    const action = TOOL_ACTIVITY[job.lastTool] ?? job.lastTool;
+    return `${action} done`;
   }
   const text = job.responseText?.trim();
   if (text) {
@@ -61,11 +65,22 @@ function fleetRow(job: Job, isLast: boolean, theme: { fg(c: string, t: string): 
     `${theme.fg("dim", guide + "└ " + toolActivity(job))}`,
   ];
 }
+function finished(job: Job): boolean {
+  const age = finishedTurnAge.get(job.id);
+  return age !== undefined && age < (job.status === "completed" ? 1 : 2);
+}
+function taskDescription(job: Job): string {
+  return ((job as Job & { tasks?: string[] }).tasks?.[0] ?? "").split("\n")[0]?.slice(0, 48) ?? "";
+}
+function finishedRow(job: Job, theme: { fg(c: string, t: string): string; bold(t: string): string }): string {
+  const success = job.status === "completed";
+  const icon = success ? theme.fg("success", "✓") : job.status === "cancelled" ? theme.fg("dim", "■") : theme.fg("error", "✗");
+  const detail = job.status === "failed" && job.error ? ` error: ${job.error.split("\n")[0].slice(0, 60)}` : job.status === "cancelled" ? " cancelled" : "";
+  return `${theme.fg("dim", "├─")} ${icon} ${theme.bold(job.agent.padEnd(9))} ${theme.fg("muted", taskDescription(job))} ${theme.fg("dim", `· ${formatElapsed(Date.now() - job.startedAt)}${detail}`)}`;
+}
 function renderFleet(manager: SubagentManager): void {
-  const active = manager.list().filter(isActive);
-  const running = active.filter((j) => j.status === "running");
-  const queued = active.filter((j) => j.status === "queued");
-  if (!active.length) {
+  const visible = manager.list().filter((job) => isActive(job) || finished(job));
+  if (!visible.length) {
     if (fleetWidget?.registered) { ui?.setWidget("45degree-fleet", undefined); fleetWidget = undefined; }
     if (widgetTimer) { clearInterval(widgetTimer); widgetTimer = undefined; }
     return;
@@ -73,26 +88,22 @@ function renderFleet(manager: SubagentManager): void {
   if (!fleetWidget?.registered) {
     ui?.setWidget("45degree-fleet", (tui, theme) => {
       fleetWidget = { tui, registered: true };
-      return {
-        render: (width: number) => {
-          const nowActive = manager.list().filter(isActive);
-          const nowRunning = nowActive.filter((j) => j.status === "running");
-          const nowQueued = nowActive.filter((j) => j.status === "queued");
-          const lines: string[] = [`${theme.fg("accent", "●")} ${theme.bold("Agents")}`];
-          nowRunning.forEach((job, i) => lines.push(...fleetRow(job, i === nowRunning.length - 1 && !nowQueued.length, theme)));
-          if (nowQueued.length) lines.push(theme.fg("dim", `└─ ○ ${nowQueued.length} queued`));
-          // One Text per line, hard-truncated to the viewport so nothing ever wraps
-          // and shifts the block (the "jumping" the user saw).
-          return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((l) => l.length > width ? l.slice(0, width) : l));
-        },
-        invalidate: () => { fleetWidget = undefined; },
-        dispose: () => { fleetWidget = undefined; },
-      };
+      return { render: (width: number) => {
+        const all = manager.list();
+        const running = all.filter((job) => job.status === "running");
+        const queued = all.filter((job) => job.status === "queued");
+        const done = all.filter(finished);
+        const lines: string[] = [`${theme.fg(running.length || queued.length ? "accent" : "dim", running.length || queued.length ? "●" : "○")} ${theme.bold("Agents")}`];
+        const entries = [...running.flatMap((job, i) => fleetRow(job, i === running.length - 1 && !queued.length && !done.length, theme)), ...(queued.length ? [theme.fg("dim", `├─ ○ ${queued.length} queued`)] : []), ...done.map((job) => finishedRow(job, theme))];
+        const capacity = MAX_WIDGET_LINES - lines.length;
+        const shown = entries.length > capacity ? Math.max(0, capacity - 1) : capacity;
+        lines.push(...entries.slice(0, shown));
+        if (entries.length > shown) lines.push(theme.fg("dim", `└─ +${entries.length - shown} more`));
+        return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((part) => part.length > width ? part.slice(0, width) : part));
+      }, invalidate: () => { fleetWidget = undefined; }, dispose: () => { fleetWidget = undefined; } };
     }, { placement: "aboveEditor" });
     if (!widgetTimer) widgetTimer = setInterval(() => renderFleet(manager), 200);
-  } else {
-    fleetWidget.tui.requestRender();
-  }
+  } else fleetWidget.tui.requestRender();
 }
 function jobText(job: Job, includeActivity = false): string {
   const elapsed = `${((Date.now() - job.startedAt) / 1000).toFixed(1)}s`;
@@ -102,35 +113,6 @@ function jobText(job: Job, includeActivity = false): string {
 function isActive(job: Job): boolean {
   return job.status === "queued" || job.status === "running";
 }
-function renderPreview(): void {
-  if (!preview || !watchedJob) return;
-  preview.markdown.setText(jobText(watchedJob, true));
-  preview.root.invalidate();
-  preview.tui.requestRender();
-}
-function showPreview(job: Job): void {
-  watchedJob = job;
-  ui?.setWidget(PREVIEW_ID, (tui, theme) => {
-    const root = new Container();
-    const markdown = new Markdown(jobText(job, true), 1, 0, getMarkdownTheme());
-    // Widgets participate in Pi's normal layout, so never obscure the editor.
-    // Bound to ~15% of the current terminal; retain the newest streaming lines.
-    const bodyLines = Math.max(3, Math.floor(tui.terminal.rows * 0.15) - 2);
-    root.addChild(new DynamicBorder((value) => theme.fg("accent", value)));
-    root.addChild({ render: (width: number) => markdown.render(width).slice(-bodyLines) });
-    root.addChild(new DynamicBorder((value) => theme.fg("accent", value)));
-    preview = { markdown, root, tui };
-    return {
-      render: (width) => root.render(width),
-      dispose: () => { if (preview?.root === root) preview = undefined; },
-    };
-  }, { placement: "aboveEditor" });
-}
-function clearPreview(): void {
-  watchedJob = undefined;
-  preview = undefined;
-  ui?.setWidget(PREVIEW_ID, undefined);
-}
 function updateStatus(manager: SubagentManager): void {
   const active = manager.list().filter(isActive);
   const running = active.filter((j) => j.status === "running").length;
@@ -138,18 +120,19 @@ function updateStatus(manager: SubagentManager): void {
   const parts: string[] = [];
   if (running) parts.push(`${running} running`);
   if (queued) parts.push(`${queued} queued`);
-  ui?.setStatus(STATUS_ID, parts.length ? `${parts.join(", ")} agent${active.length === 1 ? "" : "s"}` : undefined);
+  const next = parts.length ? `${parts.join(", ")} agent${active.length === 1 ? "" : "s"}` : undefined;
+  if (next !== lastStatus) { ui?.setStatus(STATUS_ID, next); lastStatus = next; }
 }
 
 export default function setupSubagents(pi: ExtensionAPI): void {
   const manager = new SubagentManager(agents);
   manager.onEvent((job, event) => {
+    if (event.type === "status") {
+      if (isActive(job)) finishedTurnAge.delete(job.id);
+      else finishedTurnAge.set(job.id, 0);
+    }
     updateStatus(manager);
     renderFleet(manager);
-    // The streamed preview stays opt-in via /subagents; the fleet widget covers "what is running".
-    if (job === watchedJob) {
-      if (isActive(job)) renderPreview(); else clearPreview();
-    }
     if (event.type === "status" && job.background && ["completed", "failed", "cancelled"].includes(job.status)) {
       const icon = job.status === "completed" ? "✓" : "✗";
       const first = (job.output ?? job.error ?? "No output.").split("\n")[0]?.slice(0, 80) ?? "";
@@ -165,11 +148,21 @@ export default function setupSubagents(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", (_event, ctx) => { ui = ctx.ui; });
-  pi.on("session_shutdown", async () => { clearPreview(); ui?.setStatus(STATUS_ID, undefined); await manager.shutdown(); });
+  pi.on("session_shutdown", async () => {
+    if (widgetTimer) { clearInterval(widgetTimer); widgetTimer = undefined; }
+    ui?.setWidget("45degree-fleet", undefined);
+    ui?.setStatus(STATUS_ID, undefined);
+    lastStatus = undefined;
+    await manager.shutdown();
+  });
+  pi.on("turn_end", () => {
+    for (const [id, age] of finishedTurnAge) finishedTurnAge.set(id, age + 1);
+    renderFleet(manager);
+  });
   pi.on("agent_end", async () => { await manager.waitForRunning(); });
 
   pi.registerCommand("subagents", {
-    description: "Monitor this session's subagents (Enter watches, c cancels, Esc closes)",
+    description: "Monitor this session's subagents (Enter opens conversation, Esc closes)",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") return ctx.ui.notify("/subagents requires TUI mode", "error");
       if (!manager.list().length) return ctx.ui.notify("No subagents in this session", "info");
@@ -180,8 +173,7 @@ export default function setupSubagents(pi: ExtensionAPI): void {
         list.onSelect = (item) => done(manager.get(item.value)); list.onCancel = () => done(undefined); return list;
       });
       if (!selected) return;
-      if (isActive(selected)) showPreview(selected);
-      else ctx.ui.notify(`${selected.agent} is ${selected.status}`, "info");
+      await openConversationViewer(selected, manager, ctx);
     },
   });
 

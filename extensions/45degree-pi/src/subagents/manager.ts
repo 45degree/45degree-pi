@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   createAgentSession,
   DefaultResourceLoader,
+  getAgentDir,
   ModelRuntime,
   SessionManager,
   type AgentSession,
@@ -33,6 +34,8 @@ export interface Job {
   done: Promise<void>;
   /** Live activity state, tintinweb-style: tools currently running + response text. */
   activeTools?: Map<string, string>;
+  /** Most recent tool (set on start, kept after end); cleared on next text/thinking delta. */
+  lastTool?: string;
   responseText?: string;
 }
 export interface ManagerPolicy {
@@ -173,18 +176,27 @@ export class SubagentManager {
     this.evictIdle();
     const definition = this.definitions[job.agent];
     const [provider, ...modelId] = (definition.model ?? "").split("/");
-    const runtime = await ModelRuntime.create();
+    // Single source of truth for the agent config dir: the package's own
+    // getAgentDir() (respects PI_CODING_AGENT_DIR and os.homedir()). A
+    // hand-built process.env.HOME path can diverge from ModelRuntime's
+    // implicit default when HOME/homedir() disagree.
+    const agentDir = getAgentDir();
+    const runtime = await ModelRuntime.create({
+      authPath: join(agentDir, "auth.json"),
+      modelsPath: join(agentDir, "models.json"),
+    });
     const loader = new DefaultResourceLoader({
-      cwd, agentDir: join(process.env.HOME ?? "", ".pi", "agent"), noExtensions: true,
+      cwd, agentDir, noExtensions: true,
       noSkills: true, noPromptTemplates: true, noContextFiles: false,
       additionalSkillPaths: definition.skills ?? [], systemPrompt: definition.prompt,
       extensionFactories: [omnirouteAuth as InlineExtension, magicContext as InlineExtension, createMcpExtension(job.agent)],
     });
     await loader.reload();
     // Inline providers register when AgentSession binds the extension runtime.
-    // Resolve after that binding, not before loader creation.
+    // Resolve after that binding, not before loader creation. Passing agentDir
+    // keeps sdk's own authPath/modelsPath derivation on the same directory.
     const { session } = await createAgentSession({
-      cwd, modelRuntime: runtime,
+      cwd, agentDir, modelRuntime: runtime,
       thinkingLevel: definition.thinking, tools: definition.tools,
       excludeTools: ["subagent", "ctx_memory"], resourceLoader: loader,
       sessionManager: SessionManager.create(cwd, this.sessionDir),
@@ -192,18 +204,40 @@ export class SubagentManager {
     // Hosts normally emit session_start via bindExtensions; do the same so
     // extension hooks (Magic Context retrieval, resource discovery) initialize.
     try { await session.bindExtensions({}); } catch { /* non-fatal */ }
+    await runtime.refresh({ allowNetwork: false });
+    if (provider && !runtime.hasConfiguredAuth(provider)) {
+      session.dispose();
+      throw new Error(
+        `Configured provider has no authentication: ${provider}.` +
+        ` agentDir=${agentDir} (auth.json / models.json).`,
+      );
+    }
     let model = modelId.length ? runtime.getModel(provider, modelId.join("/")) : undefined;
     if (!model && modelId.length && provider) {
       // Native-provider registration kicks an async stored-models restore
       // (models-store.json); wait for it deterministically before resolving.
-      try { await runtime.refresh({ providers: [provider], allowNetwork: false }); } catch { /* best effort */ }
+      // Surface refresh errors (provider, auth/models paths, configured
+      // model) instead of swallowing them — errors never contain the key.
+      const refreshResult = await runtime.refresh({ providers: [provider], allowNetwork: false }).catch((error: unknown) => error);
       model = runtime.getModel(provider, modelId.join("/"));
+      if (!model) {
+        session.dispose();
+        const errors = refreshResult instanceof Error
+          ? [`${provider}: ${refreshResult.message}`]
+          : [...(refreshResult as { errors: ReadonlyMap<string, Error> }).errors.entries()].map(([id, err]) => `${id}: ${err.message}`);
+        const detail = errors.length ? ` Refresh errors: ${errors.join("; ")}.` : "";
+        throw new Error(
+          `Configured model is unavailable: ${definition.model}.` +
+          ` agentDir=${agentDir} (auth.json / models.json).` +
+          `${detail}`,
+        );
+      }
     }
     if (definition.model && !model) {
       session.dispose();
       throw new Error(`Configured model is unavailable: ${definition.model}`);
     }
-    if (model) session.setModel(model);
+    if (model) await session.setModel(model);
     job.session = session; job.sessionId = session.sessionId; job.sessionFile = session.sessionFile ?? undefined;
   }
   private forward(job: Job, event: AgentSessionEvent): void {
@@ -211,6 +245,8 @@ export class SubagentManager {
     if (data.type === "message_update" && data.assistantMessageEvent?.delta) {
       const type = data.assistantMessageEvent.type === "thinking_delta" ? "thinking" : data.assistantMessageEvent.type === "text_delta" ? "text" : undefined;
       if (type) {
+        // New assistant output supersedes any finished tool activity.
+        job.lastTool = undefined;
         const activity = job.activity ??= [];
         activity.push(data.assistantMessageEvent.delta);
         if (activity.length > 200) activity.shift();
@@ -224,6 +260,7 @@ export class SubagentManager {
         activity.push(`\n[tool] ${data.toolName ?? "unknown"}\n`);
         if (activity.length > 200) activity.shift();
         (job.activeTools ??= new Map()).set(`${data.toolName}_${Date.now()}`, data.toolName ?? "unknown");
+        job.lastTool = data.toolName ?? "unknown";
       } else {
         const tools = job.activeTools;
         if (tools) for (const [key, name] of tools) { if (name === data.toolName) { tools.delete(key); break; } }
