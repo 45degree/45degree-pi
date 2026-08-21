@@ -7,7 +7,7 @@
   ],
   "extensions": [],
   "defaultProvider": "omniroute",
-  "defaultModel": "omos-explorer",
+  "defaultModel": "omos-orchestrator",
   "defaultThinkingLevel": "off",
   "hideThinkingBlock": false
 }

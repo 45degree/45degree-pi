@@ -5,10 +5,12 @@ import { agentDirectory, agents, isAgentName } from "./agents.ts";
 import { openConversationViewer } from "./conversation-viewer.ts";
 import { SubagentManager, type Job } from "./manager.ts";
 
-const action = Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("status"), Type.Literal("result"), Type.Literal("cancel"), Type.Literal("session")]));
+const action = Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("cancel")]));
 const parameters = Type.Object({ action, agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), async: Type.Optional(Type.Boolean()), task_id: Type.Optional(Type.String()) });
+const queryParameters = Type.Object({ action: Type.Union([Type.Literal("status"), Type.Literal("result"), Type.Literal("session")]), task_id: Type.String() });
 const SUBAGENT_RESULT = "__45degree_subagent_result";
 const SUBAGENT_RESULT_RE = /^Background subagent finished:/;
+const SUBAGENT_QUERY = "__45degree_subagent_query";
 const STATUS_ID = "45degree-subagents";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TOOL_ACTIVITY: Record<string, string> = { read: "reading", bash: "running command", edit: "editing", write: "writing", grep: "searching", find: "finding files", ls: "listing" };
@@ -185,19 +187,15 @@ export default function setupSubagents(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "subagent", label: "Subagent",
-    description: "Delegate a focused task. Supply {agent, task} to create a session; supply {task_id, task} to continue it. Actions: status, result, session, cancel use task_id.",
+    description: "Delegate a focused task. Supply {agent, task} to create a session, or {task_id, task} to continue it. Use action: cancel with task_id to cancel. Use subagent_query for status, result, or session.",
     parameters,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (signal?.aborted) throw new Error("Subagent request aborted");
       const input = params as { action?: string; agent?: string; task?: string; async?: boolean; task_id?: string };
-      if (input.action && input.action !== "start") {
+      if (input.action === "cancel") {
         if (!input.task_id) throw new Error("task_id is required for this action");
-        if (input.action === "cancel") {
-          const job = (await manager.cancel(input.task_id)) ?? (() => { throw new Error(`Unknown subagent id: ${input.task_id}`); })();
-          return { content: [{ type: "text", text: jobText(job) }], details: undefined };
-        }
-        const job = manager.get(input.task_id); if (!job) throw new Error(`Unknown subagent id: ${input.task_id}`);
-        return { content: [{ type: "text", text: input.action === "session" ? `sessionId: ${job.sessionId ?? "pending"}\nsessionFile: ${job.sessionFile ?? "pending"}` : jobText(job) }], details: undefined };
+        const job = (await manager.cancel(input.task_id)) ?? (() => { throw new Error(`Unknown subagent id: ${input.task_id}`); })();
+        return { content: [{ type: "text", text: jobText(job) }], details: undefined };
       }
       if (!input.task) throw new Error("task is required");
       let job: Job;
@@ -211,11 +209,25 @@ export default function setupSubagents(pi: ExtensionAPI): void {
       onUpdate?.({ content: [{ type: "text", text: jobText(job) }], details: undefined });
       return { content: [{ type: "text", text: jobText(job) }], details: undefined };
     },
+  });
+
+  pi.registerTool({
+    name: "subagent_query", label: "Subagent query",
+    description: "Query a subagent without displaying successful calls. Supply {action, task_id}; action is status, result, or session.",
+    parameters: queryParameters,
+    renderShell: "self",
+    renderCall() { return new Text("", 0, 0); },
+    async execute(_toolCallId, params, signal) {
+      if (signal?.aborted) throw new Error("Subagent request aborted");
+      const input = params as { action: "status" | "result" | "session"; task_id: string };
+      const job = manager.get(input.task_id);
+      if (!job) throw new Error(`Unknown subagent id: ${input.task_id}`);
+      const text = input.action === "session" ? `sessionId: ${job.sessionId ?? "pending"}\nsessionFile: ${job.sessionFile ?? "pending"}` : jobText(job);
+      return { content: [{ type: "text", text }], details: { internal: SUBAGENT_QUERY } };
+    },
     renderResult(result, _options, _theme, context) {
       const output = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
-      const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
-      text.setText(SUBAGENT_RESULT_RE.test(output) ? "" : output);
-      return text;
+      return new Text(context.isError ? output : "", 0, 0);
     },
   });
 }
