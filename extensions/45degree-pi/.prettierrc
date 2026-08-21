@@ -1,0 +1,8 @@
+{
+  "printWidth": 99999,
+  "tabWidth": 2,
+  "useTabs": false,
+  "bracketSpacing": false,
+  "proseWrap": "never",
+  "trailingComma": "none"
+}

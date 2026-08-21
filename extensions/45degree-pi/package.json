@@ -8,9 +8,23 @@
     "pi-mcp-adapter": "^2.26.1"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.2",
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-client": "0.84.1",
+    "@earendil-works/pi-protocol": "0.84.1",
+    "@earendil-works/pi-telemetry": "0.84.1"
   }
 }

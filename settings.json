@@ -2,11 +2,12 @@
   "lastChangelogVersion": "0.84.2",
   "theme": "dark",
   "packages": [
-    "npm:pi-zentui"
+    "npm:pi-zentui",
+    "npm:@cortexkit/pi-magic-context"
   ],
   "extensions": [],
   "defaultProvider": "omniroute",
   "defaultModel": "omos-explorer",
-  "defaultThinkingLevel": "xhigh",
-  "hideThinkingBlock": true
+  "defaultThinkingLevel": "off",
+  "hideThinkingBlock": false
 }

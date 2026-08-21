@@ -1,18 +1,19 @@
 // omniroute - pi extension for an OmniRoute-style, OpenAI-compatible gateway.
 //
-// Registers ONE provider backed by pi's native `openai-completions`
-// implementation. Everything the OpenCode plugin had to build by hand is
-// native in pi:
+// Registers ONE provider through pi's native extension provider API,
+// pi.registerProvider(id, config), tagged with the `openai-completions`
+// API so streaming goes through pi-ai's lazy compat registry:
 //
-//   - provider registration ........ pi.registerProvider(createProvider(...))
-//   - masked API-key login ......... auth.apiKey.login with a `secret` prompt;
-//                                    pi persists it in ~/.pi/agent/auth.json
+//   - provider registration ........ pi.registerProvider(id, {...})
+//   - masked API-key login ......... pi's built-in api_key auth: /login shows
+//                                    a `secret` prompt and persists it in
+//                                    ~/.pi/agent/auth.json
 //   - Bearer injection + prefix .... the openai-completions stream applies the
 //                                    resolved key as the Bearer credential
-//   - model catalog caching ........ createProvider's refreshModels wrapper
-//                                    restores `context.stored` from
-//                                    models-store.json and publishes fetched
-//                                    lists transactionally
+//   - model catalog persistence .... refreshModels publishes fetched lists
+//                                    transactionally via context.publish, so
+//                                    offline starts restore them from
+//                                    models-store.json
 //   - refresh scheduling ........... pi calls refreshModels during model
 //                                    refresh (startup, /model picker, etc.)
 //                                    and skips network work when no credential
@@ -30,7 +31,6 @@
 // model refresh happens exclusively through pi's native model-refresh flow.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai";
 import { fetchGatewayModels, storedModelsFor } from "./catalog";
 import { isRegistered, makeGuardKey, registerInstance } from "./guard";
 import { readOmnirouteConfig, resolveWithFallback } from "./options";
@@ -51,62 +51,45 @@ export default function (pi: ExtensionAPI): void {
   const guardToken = { guard: true };
   registerInstance(pi, guardKey, guardToken);
 
-  const provider = createProvider({
-    id: resolved.providerId,
+  // Registering during the extension factory queues the provider so it is
+  // available during interactive startup and to `pi --list-models`.
+  pi.registerProvider(resolved.providerId, {
     name: resolved.displayName,
     baseUrl: resolved.v1URL,
-    auth: {
-      apiKey: {
-        name: `${resolved.displayName} API key`,
-        // Masked single-entry login: pi's `secret` prompt captures the key
-        // once and persists it as an api_key credential for this provider.
-        async login(interaction) {
-          const key = await interaction.prompt({
-            type: "secret",
-            message: `${resolved.displayName} API key`,
-          });
-          return { type: "api_key", key };
-        },
-        // Hand the stored key back as the Bearer credential. undefined =
-        // provider unconfigured (pi then hides the provider's models until
-        // the user runs /login).
-        async resolve({ credential }) {
-          const key =
-            credential?.type === "api_key" ? credential.key : undefined;
-          if (key === undefined || key === "") return undefined;
-          return { auth: { apiKey: key }, source: "stored API key" };
-        },
-      },
-    },
-    // Purely dynamic provider: the catalog comes from the gateway via
-    // fetchModels below (restored from models-store.json on offline starts).
-    models: [],
-    api: openAICompletionsApi(),
-    async fetchModels(context) {
+    // Native openai-completions streams (Bearer auth, /chat/completions) are
+    // resolved lazily by pi-ai's compat registry from this API tag.
+    api: "openai-completions",
+    // OmniRoute's WAF blocks the OpenAI SDK's default User-Agent. Provider
+    // headers override SDK defaults while leaving Pi's native stream intact.
+    headers: { "User-Agent": "pi" },
+    // No `apiKey` and no static `models`: the provider is purely dynamic and
+    // stays unconfigured (its models hidden) until the user completes pi's
+    // masked /login secret prompt for this provider.
+    async refreshModels(context) {
       const key =
         context.credential?.type === "api_key"
           ? context.credential.key
           : undefined;
       // No usable credential: keep the persisted catalog untouched (pi's
-      // wrapper skips the network phase entirely when resolve() returns
-      // undefined, so this is only a defensive fallback).
+      // refresh loop skips the network phase entirely when auth resolution
+      // yields nothing, so this is only a defensive fallback).
       if (key === undefined || key === "") {
         return storedModelsFor(context, resolved.providerId);
       }
       // THROWS on failure (network error, empty/malformed list) so pi keeps
       // the previously restored catalog instead of publishing a blank one.
-      return fetchGatewayModels(
+      const models = await fetchGatewayModels(
         resolved.modelsURL,
         key,
         { providerId: resolved.providerId, v1URL: resolved.v1URL },
         resolved.excludeProviders,
-        resolved.excludeOwnedBy,
+        undefined,
         context.signal,
       );
+      // Persist transactionally (generation-checked) so offline starts can
+      // restore the catalog from models-store.json.
+      await context.publish({ persist: { models, checkedAt: Date.now() } });
+      return models;
     },
   });
-
-  // Registering during the extension factory queues the provider so it is
-  // available during interactive startup and to `pi --list-models`.
-  pi.registerProvider(provider);
 }

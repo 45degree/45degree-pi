@@ -138,17 +138,30 @@ function normalizeRawEntry(entry: unknown): RawModel | null {
   const e = entry as Record<string, unknown>;
   if (typeof e.id !== "string") return null;
   const caps = e.capabilities as Record<string, unknown> | undefined;
+  // Narrowed to locals first so optional fields can be OMITTED when no usable
+  // value exists (exactOptionalPropertyTypes: `prop: undefined` is not
+  // assignable to `prop?: T`).
+  const name = typeof e.name === "string" ? e.name : undefined;
+  const ownedBy =
+    typeof e.owned_by === "string" && e.owned_by.trim() !== "" ? e.owned_by.trim() : undefined;
+  const context = asNum(e.context) ?? asNum(e.max_input_tokens);
+  const output = asNum(e.output) ?? asNum(e.max_output_tokens);
+  const vision = asBool(e.vision) ?? asBool(caps?.vision);
+  const toolcall = asBool(e.toolcall) ?? asBool(caps?.tool_calling);
+  const reasoning = asBool(e.reasoning) ?? asBool(caps?.reasoning);
+  const effortTiers = asStrArray(e.effortTiers) ?? asStrArray(caps?.effort_tiers);
+  const parent = typeof e.parent === "string" && e.parent !== "" ? e.parent : undefined;
   return {
     id: e.id,
-    name: typeof e.name === "string" ? e.name : undefined,
-    ownedBy: typeof e.owned_by === "string" && e.owned_by.trim() !== "" ? e.owned_by.trim() : undefined,
-    context: asNum(e.context) ?? asNum(e.max_input_tokens),
-    output: asNum(e.output) ?? asNum(e.max_output_tokens),
-    vision: asBool(e.vision) ?? asBool(caps?.vision),
-    toolcall: asBool(e.toolcall) ?? asBool(caps?.tool_calling),
-    reasoning: asBool(e.reasoning) ?? asBool(caps?.reasoning),
-    effortTiers: asStrArray(e.effortTiers) ?? asStrArray(caps?.effort_tiers),
-    parent: typeof e.parent === "string" && e.parent !== "" ? e.parent : undefined,
+    ...(name !== undefined ? { name } : {}),
+    ...(ownedBy !== undefined ? { ownedBy } : {}),
+    ...(context !== undefined ? { context } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(vision !== undefined ? { vision } : {}),
+    ...(toolcall !== undefined ? { toolcall } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(effortTiers !== undefined ? { effortTiers } : {}),
+    ...(parent !== undefined ? { parent } : {}),
   };
 }
 
@@ -337,11 +350,14 @@ export function compileModels(
     if (seen.has(id)) continue; // first occurrence wins
     seen.add(id);
     const parentRaw = typeof raw.parent === "string" ? raw.parent.trim() : undefined;
-    normalized.push({
+    // Omit `parent` entirely when no non-empty value survives normalization
+    // (exactOptionalPropertyTypes forbids assigning literal `undefined`).
+    const normalizedEntry: RawModel = {
       ...raw,
       id,
-      parent: parentRaw !== undefined && parentRaw !== "" ? parentRaw : undefined,
-    });
+      ...(parentRaw !== undefined && parentRaw !== "" ? { parent: parentRaw } : {}),
+    };
+    normalized.push(normalizedEntry);
   }
   // Stage 2: exclusion (OR of id-prefix and owned_by exact). Skip the filter
   // pass entirely when both lists are empty so the common no-filter path stays

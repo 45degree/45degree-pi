@@ -7,6 +7,11 @@
  * - mcp.agents: per-subagent MCP server patterns; agents absent here get none.
  * - agents: overrides applied onto the built-in agent defaults in agents.ts.
  */
+import type { AgentName } from "./subagents/agents.ts";
+
+/** Re-export so downstream modules depend on config, not subagents internals. */
+export type { AgentName };
+
 export interface AgentOverrides {
   tools?: string[];
   skills?: string[];
@@ -14,12 +19,21 @@ export interface AgentOverrides {
   model?: string;
 }
 
-export const config = {
+/** Typed shape of the static config object declared below. */
+export interface ExtensionConfig {
+  readonly mcp: {
+    readonly session: readonly string[];
+    readonly agents: Partial<Record<AgentName, readonly string[]>>;
+  };
+  readonly agents: Partial<Record<AgentName, AgentOverrides>>;
+}
+
+export const config: ExtensionConfig = {
   mcp: {
     session: ["*", "!context7"],
     agents: {
       librarian: ["tavily", "context7", "gh_grep"],
-    } as Record<string, string[]>,
+    },
   },
   agents: {
     explorer: { model: "omniroute/omos-explorer" },
@@ -27,5 +41,5 @@ export const config = {
     observer: { model: "omniroute/omos-observer" },
     oracle: { skills: [], model: "omniroute/omos-oracle" },
     fixer: { model: "omniroute/omos-fixer" },
-  } as Record<string, AgentOverrides>,
+  },
 };

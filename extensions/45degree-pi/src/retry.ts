@@ -11,38 +11,74 @@ function delayFor(error: string, attempt: number): number {
     : Number(resetAfter) * 1_000;
 }
 
+/**
+ * Explicit per-extension retry state. Replaces the loose closure variables
+ * (`attempts`, `pendingCleanup`) with named, encapsulated transitions.
+ */
+class RetryController {
+  #attempts = 0;
+  #pendingCleanup = false;
+
+  /** A completed non-error assistant turn restores the full retry budget. */
+  noteSuccess(): void {
+    this.#attempts = 0;
+  }
+
+  /** Reserve the next retry attempt; returns false when the budget is spent. */
+  tryAcquire(): boolean {
+    if (this.#attempts >= MAX_RETRIES) return false;
+    this.#attempts++;
+    return true;
+  }
+
+  /** Current 1-based attempt count (set by tryAcquire). */
+  get attempt(): number {
+    return this.#attempts;
+  }
+
+  /** Arm the one-shot context cleanup for the injected retry trigger. */
+  armCleanup(): void {
+    this.#pendingCleanup = true;
+  }
+
+  /** Consume the cleanup flag; true exactly once per armCleanup call. */
+  consumeCleanup(): boolean {
+    if (!this.#pendingCleanup) return false;
+    this.#pendingCleanup = false;
+    return true;
+  }
+}
+
 /** Retry any provider response that ends with an API error. */
 export default function retryErrors(pi: ExtensionAPI): void {
-  let attempts = 0;
-  let pendingCleanup = false;
+  const controller = new RetryController();
 
   pi.on("turn_end", (event) => {
-    const message = event.message as { role?: string; stopReason?: string };
+    const message = event.message;
     if (message.role === "assistant" && message.stopReason !== "error") {
-      attempts = 0;
+      controller.noteSuccess();
     }
   });
 
   pi.on("agent_end", async (event, ctx) => {
     const message = [...event.messages]
       .reverse()
-      .find((item) => item.role === "assistant") as
-      { stopReason?: string; errorMessage?: string } | undefined;
-    if (message?.stopReason !== "error") return;
+      .find((m) => m.role === "assistant");
+    if (message === undefined || message.role !== "assistant") return;
+    if (message.stopReason !== "error") return;
 
-    if (attempts >= MAX_RETRIES) return;
-    const attempt = ++attempts;
+    if (!controller.tryAcquire()) return;
     const error = message.errorMessage ?? "Model API error";
-    const delay = delayFor(error, attempt - 1);
+    const delay = delayFor(error, controller.attempt - 1);
 
     ctx.ui.setStatus(
       "45degree-retry",
-      `API error; retrying (${attempt}/${MAX_RETRIES}) in ${(delay / 1_000).toFixed(1)}s…`,
+      `API error; retrying (${controller.attempt}/${MAX_RETRIES}) in ${(delay / 1_000).toFixed(1)}s…`,
     );
     await new Promise((resolve) => setTimeout(resolve, delay));
     ctx.ui.setStatus("45degree-retry", undefined);
 
-    pendingCleanup = true;
+    controller.armCleanup();
     pi.sendMessage(
       { customType: RETRY_TRIGGER, content: "Retrying.", display: false },
       { triggerTurn: true },
@@ -50,12 +86,10 @@ export default function retryErrors(pi: ExtensionAPI): void {
   });
 
   pi.on("context", (event) => {
-    if (!pendingCleanup) return;
-    pendingCleanup = false;
+    if (!controller.consumeCleanup()) return;
     return {
       messages: event.messages.filter(
-        (message: any) =>
-          message.role !== "custom" || message.customType !== RETRY_TRIGGER,
+        (m) => !(m.role === "custom" && m.customType === RETRY_TRIGGER),
       ),
     };
   });

@@ -13,12 +13,16 @@ const STATUS_ID = "45degree-subagents";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TOOL_ACTIVITY: Record<string, string> = { read: "reading", bash: "running command", edit: "editing", write: "writing", grep: "searching", find: "finding files", ls: "listing" };
 const MAX_WIDGET_LINES = 12;
-let ui: ExtensionUIContext | undefined;
-let spinnerFrame = 0;
-let widgetTimer: ReturnType<typeof setInterval> | undefined;
-let lastStatus: string | undefined;
-const finishedTurnAge = new Map<string, number>();
-let fleetWidget: { tui: { requestRender(): void }; registered: boolean } | undefined;
+// Per-setup mutable runtime state: each setupSubagents(pi) call creates one
+// controller so concurrent/reloaded extension instances never share state.
+type FleetController = {
+  ui: ExtensionUIContext | undefined;
+  spinnerFrame: number;
+  widgetTimer: ReturnType<typeof setInterval> | undefined;
+  lastStatus: string | undefined;
+  finishedTurnAge: Map<string, number>;
+  fleetWidget: { tui: { requestRender(): void }; registered: boolean } | undefined;
+};
 
 function toolActivity(job: Job): string {
   // tintinweb pi-subagents describeActivity: running tools first, grouped;
@@ -51,22 +55,22 @@ function formatElapsed(ms: number): string {
   const s = ms / 1000;
   return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m${Math.round(s % 60)}s`;
 }
-function fleetRow(job: Job, isLast: boolean, theme: { fg(c: string, t: string): string; bold(t: string): string }): string[] {
+function fleetRow(ctl: FleetController, job: Job, isLast: boolean, theme: { fg(c: string, t: string): string; bold(t: string): string }): string[] {
   const branch = isLast ? "└─" : "├─";
   const guide = isLast ? "   " : "│  ";
-  spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+  ctl.spinnerFrame = (ctl.spinnerFrame + 1) % SPINNER.length;
   // Description: first line of the latest task text.
   const task = (job as Job & { tasks?: string[] }).tasks?.[0] ?? "";
   const desc = task.split("\n")[0]?.slice(0, 48) ?? "";
   // Fixed-width elapsed so ticking digits never re-flow the line.
   const stats = formatElapsed(Date.now() - job.startedAt).padStart(6, " ");
   return [
-    `${theme.fg("dim", branch)} ${theme.fg("accent", SPINNER[spinnerFrame])} ${theme.bold(job.agent.padEnd(9))} ${theme.fg("muted", desc)} ${theme.fg("dim", "· " + stats)}`,
+    `${theme.fg("dim", branch)} ${theme.fg("accent", SPINNER[ctl.spinnerFrame] ?? "⠋")} ${theme.bold(job.agent.padEnd(9))} ${theme.fg("muted", desc)} ${theme.fg("dim", "· " + stats)}`,
     `${theme.fg("dim", guide + "└ " + toolActivity(job))}`,
   ];
 }
-function finished(job: Job): boolean {
-  const age = finishedTurnAge.get(job.id);
+function finished(ctl: FleetController, job: Job): boolean {
+  const age = ctl.finishedTurnAge.get(job.id);
   return age !== undefined && age < (job.status === "completed" ? 1 : 2);
 }
 function taskDescription(job: Job): string {
@@ -75,35 +79,35 @@ function taskDescription(job: Job): string {
 function finishedRow(job: Job, theme: { fg(c: string, t: string): string; bold(t: string): string }): string {
   const success = job.status === "completed";
   const icon = success ? theme.fg("success", "✓") : job.status === "cancelled" ? theme.fg("dim", "■") : theme.fg("error", "✗");
-  const detail = job.status === "failed" && job.error ? ` error: ${job.error.split("\n")[0].slice(0, 60)}` : job.status === "cancelled" ? " cancelled" : "";
+  const detail = job.status === "failed" && job.error ? ` error: ${(job.error.split("\n")[0] ?? "").slice(0, 60)}` : job.status === "cancelled" ? " cancelled" : "";
   return `${theme.fg("dim", "├─")} ${icon} ${theme.bold(job.agent.padEnd(9))} ${theme.fg("muted", taskDescription(job))} ${theme.fg("dim", `· ${formatElapsed(Date.now() - job.startedAt)}${detail}`)}`;
 }
-function renderFleet(manager: SubagentManager): void {
-  const visible = manager.list().filter((job) => isActive(job) || finished(job));
+function renderFleet(ctl: FleetController, manager: SubagentManager): void {
+  const visible = manager.list().filter((job) => isActive(job) || finished(ctl, job));
   if (!visible.length) {
-    if (fleetWidget?.registered) { ui?.setWidget("45degree-fleet", undefined); fleetWidget = undefined; }
-    if (widgetTimer) { clearInterval(widgetTimer); widgetTimer = undefined; }
+    if (ctl.fleetWidget?.registered) { ctl.ui?.setWidget("45degree-fleet", undefined); ctl.fleetWidget = undefined; }
+    if (ctl.widgetTimer) { clearInterval(ctl.widgetTimer); ctl.widgetTimer = undefined; }
     return;
   }
-  if (!fleetWidget?.registered) {
-    ui?.setWidget("45degree-fleet", (tui, theme) => {
-      fleetWidget = { tui, registered: true };
+  if (!ctl.fleetWidget?.registered) {
+    ctl.ui?.setWidget("45degree-fleet", (tui, theme) => {
+      ctl.fleetWidget = { tui, registered: true };
       return { render: (width: number) => {
         const all = manager.list();
         const running = all.filter((job) => job.status === "running");
         const queued = all.filter((job) => job.status === "queued");
-        const done = all.filter(finished);
+        const done = all.filter((job) => finished(ctl, job));
         const lines: string[] = [`${theme.fg(running.length || queued.length ? "accent" : "dim", running.length || queued.length ? "●" : "○")} ${theme.bold("Agents")}`];
-        const entries = [...running.flatMap((job, i) => fleetRow(job, i === running.length - 1 && !queued.length && !done.length, theme)), ...(queued.length ? [theme.fg("dim", `├─ ○ ${queued.length} queued`)] : []), ...done.map((job) => finishedRow(job, theme))];
+        const entries = [...running.flatMap((job, i) => fleetRow(ctl, job, i === running.length - 1 && !queued.length && !done.length, theme)), ...(queued.length ? [theme.fg("dim", `├─ ○ ${queued.length} queued`)] : []), ...done.map((job) => finishedRow(job, theme))];
         const capacity = MAX_WIDGET_LINES - lines.length;
         const shown = entries.length > capacity ? Math.max(0, capacity - 1) : capacity;
         lines.push(...entries.slice(0, shown));
         if (entries.length > shown) lines.push(theme.fg("dim", `└─ +${entries.length - shown} more`));
         return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((part) => part.length > width ? part.slice(0, width) : part));
-      }, invalidate: () => { fleetWidget = undefined; }, dispose: () => { fleetWidget = undefined; } };
+      }, invalidate: () => { ctl.fleetWidget = undefined; }, dispose: () => { ctl.fleetWidget = undefined; } };
     }, { placement: "aboveEditor" });
-    if (!widgetTimer) widgetTimer = setInterval(() => renderFleet(manager), 200);
-  } else fleetWidget.tui.requestRender();
+    if (!ctl.widgetTimer) ctl.widgetTimer = setInterval(() => renderFleet(ctl, manager), 200);
+  } else ctl.fleetWidget.tui.requestRender();
 }
 function jobText(job: Job, includeActivity = false): string {
   const elapsed = `${((Date.now() - job.startedAt) / 1000).toFixed(1)}s`;
@@ -113,7 +117,7 @@ function jobText(job: Job, includeActivity = false): string {
 function isActive(job: Job): boolean {
   return job.status === "queued" || job.status === "running";
 }
-function updateStatus(manager: SubagentManager): void {
+function updateStatus(ctl: FleetController, manager: SubagentManager): void {
   const active = manager.list().filter(isActive);
   const running = active.filter((j) => j.status === "running").length;
   const queued = active.length - running;
@@ -121,18 +125,19 @@ function updateStatus(manager: SubagentManager): void {
   if (running) parts.push(`${running} running`);
   if (queued) parts.push(`${queued} queued`);
   const next = parts.length ? `${parts.join(", ")} agent${active.length === 1 ? "" : "s"}` : undefined;
-  if (next !== lastStatus) { ui?.setStatus(STATUS_ID, next); lastStatus = next; }
+  if (next !== ctl.lastStatus) { ctl.ui?.setStatus(STATUS_ID, next); ctl.lastStatus = next; }
 }
 
 export default function setupSubagents(pi: ExtensionAPI): void {
   const manager = new SubagentManager(agents);
+  const ctl: FleetController = { ui: undefined, spinnerFrame: 0, widgetTimer: undefined, lastStatus: undefined, finishedTurnAge: new Map(), fleetWidget: undefined };
   manager.onEvent((job, event) => {
     if (event.type === "status") {
-      if (isActive(job)) finishedTurnAge.delete(job.id);
-      else finishedTurnAge.set(job.id, 0);
+      if (isActive(job)) ctl.finishedTurnAge.delete(job.id);
+      else ctl.finishedTurnAge.set(job.id, 0);
     }
-    updateStatus(manager);
-    renderFleet(manager);
+    updateStatus(ctl, manager);
+    renderFleet(ctl, manager);
     if (event.type === "status" && job.background && ["completed", "failed", "cancelled"].includes(job.status)) {
       const icon = job.status === "completed" ? "✓" : "✗";
       const first = (job.output ?? job.error ?? "No output.").split("\n")[0]?.slice(0, 80) ?? "";
@@ -147,17 +152,18 @@ export default function setupSubagents(pi: ExtensionAPI): void {
     return container;
   });
 
-  pi.on("session_start", (_event, ctx) => { ui = ctx.ui; });
+  pi.on("session_start", (_event, ctx) => { ctl.ui = ctx.ui; });
   pi.on("session_shutdown", async () => {
-    if (widgetTimer) { clearInterval(widgetTimer); widgetTimer = undefined; }
-    ui?.setWidget("45degree-fleet", undefined);
-    ui?.setStatus(STATUS_ID, undefined);
-    lastStatus = undefined;
+    if (ctl.widgetTimer) { clearInterval(ctl.widgetTimer); ctl.widgetTimer = undefined; }
+    ctl.ui?.setWidget("45degree-fleet", undefined);
+    ctl.fleetWidget = undefined;
+    ctl.ui?.setStatus(STATUS_ID, undefined);
+    ctl.lastStatus = undefined;
     await manager.shutdown();
   });
   pi.on("turn_end", () => {
-    for (const [id, age] of finishedTurnAge) finishedTurnAge.set(id, age + 1);
-    renderFleet(manager);
+    for (const [id, age] of ctl.finishedTurnAge) ctl.finishedTurnAge.set(id, age + 1);
+    renderFleet(ctl, manager);
   });
   pi.on("agent_end", async () => { await manager.waitForRunning(); });
 
@@ -182,16 +188,16 @@ export default function setupSubagents(pi: ExtensionAPI): void {
     description: "Delegate a focused task. Supply {agent, task} to create a session; supply {task_id, task} to continue it. Actions: status, result, session, cancel use task_id.",
     parameters,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (signal.aborted) throw new Error("Subagent request aborted");
+      if (signal?.aborted) throw new Error("Subagent request aborted");
       const input = params as { action?: string; agent?: string; task?: string; async?: boolean; task_id?: string };
       if (input.action && input.action !== "start") {
         if (!input.task_id) throw new Error("task_id is required for this action");
         if (input.action === "cancel") {
           const job = (await manager.cancel(input.task_id)) ?? (() => { throw new Error(`Unknown subagent id: ${input.task_id}`); })();
-          return { content: [{ type: "text", text: jobText(job) }] };
+          return { content: [{ type: "text", text: jobText(job) }], details: undefined };
         }
         const job = manager.get(input.task_id); if (!job) throw new Error(`Unknown subagent id: ${input.task_id}`);
-        return { content: [{ type: "text", text: input.action === "session" ? `sessionId: ${job.sessionId ?? "pending"}\nsessionFile: ${job.sessionFile ?? "pending"}` : jobText(job) }] };
+        return { content: [{ type: "text", text: input.action === "session" ? `sessionId: ${job.sessionId ?? "pending"}\nsessionFile: ${job.sessionFile ?? "pending"}` : jobText(job) }], details: undefined };
       }
       if (!input.task) throw new Error("task is required");
       let job: Job;
@@ -200,14 +206,14 @@ export default function setupSubagents(pi: ExtensionAPI): void {
         if (!input.agent || !isAgentName(input.agent)) throw new Error(`agent must be one of: ${Object.keys(agents).join(", ")}`);
         job = manager.start(input.agent, input.task, ctx.cwd, input.async === true);
       }
-      if (input.async) return { content: [{ type: "text", text: `Started background subagent ${job.id} (${job.agent}).` }] };
+      if (input.async) return { content: [{ type: "text", text: `Started background subagent ${job.id} (${job.agent}).` }], details: undefined };
       await job.done;
-      onUpdate?.({ content: [{ type: "text", text: jobText(job) }] });
-      return { content: [{ type: "text", text: jobText(job) }] };
+      onUpdate?.({ content: [{ type: "text", text: jobText(job) }], details: undefined });
+      return { content: [{ type: "text", text: jobText(job) }], details: undefined };
     },
     renderResult(result, _options, _theme, context) {
       const output = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
-      const text = context.lastComponent ?? new Text("", 0, 0);
+      const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
       text.setText(SUBAGENT_RESULT_RE.test(output) ? "" : output);
       return text;
     },

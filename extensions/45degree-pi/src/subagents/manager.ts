@@ -12,7 +12,6 @@ import {
   type AgentSessionEvent,
   type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
-import magicContext from "@cortexkit/pi-magic-context";
 import omnirouteAuth from "../omniroute/auth.ts";
 import createMcpExtension from "../mcp.ts";
 import type { AgentDefinition, AgentName } from "./agents.ts";
@@ -28,15 +27,23 @@ export interface Job {
   activity?: string[];
   error?: string;
   background: boolean;
-  session?: AgentSession;
+  session?: AgentSession | undefined;
   sessionId?: string;
-  sessionFile?: string;
+  // exactOptionalPropertyTypes: fields are explicitly cleared with `undefined`
+  // (never deleted), so the declared type must admit it.
+  sessionFile?: string | undefined;
   done: Promise<void>;
   /** Live activity state, tintinweb-style: tools currently running + response text. */
   activeTools?: Map<string, string>;
   /** Most recent tool (set on start, kept after end); cleared on next text/thinking delta. */
-  lastTool?: string;
+  lastTool?: string | undefined;
   responseText?: string;
+}
+/** Manager-private runtime state; extends the public Job but is never part of its API. */
+interface ManagedJob extends Job {
+  cwd: string;
+  tasks: string[];
+  resolve: () => void;
 }
 export interface ManagerPolicy {
   concurrency: () => number;
@@ -48,7 +55,7 @@ const defaultPolicy: ManagerPolicy = {
 };
 
 export class SubagentManager {
-  private readonly jobs = new Map<string, Job>();
+  private readonly jobs = new Map<string, ManagedJob>();
   private readonly queues = new Map<string, string[]>();
   private readonly listeners = new Set<(job: Job, event: JobEvent) => void>();
   private readonly sessionDir = join(tmpdir(), "45degree-pi-subagents");
@@ -69,9 +76,7 @@ export class SubagentManager {
   get(id: string): Job | undefined { return this.jobs.get(id); }
 
   start(agent: AgentName, task: string, cwd: string, background = false): Job {
-    const job = this.makeJob(agent, background);
-    (job as Job & { cwd?: string; tasks?: string[] }).cwd = cwd;
-    (job as Job & { cwd?: string; tasks?: string[] }).tasks = [task];
+    const job = this.makeJob(agent, background, cwd, task);
     this.jobs.set(job.id, job);
     this.enqueue(job.id);
     return job;
@@ -80,8 +85,7 @@ export class SubagentManager {
   append(id: string, task: string): Job {
     const job = this.jobs.get(id);
     if (!job) throw new Error(`Unknown subagent id: ${id}`);
-    const internal = job as Job & { tasks: string[] };
-    internal.tasks.push(task);
+    job.tasks.push(task);
     if (job.status !== "running" && job.status !== "queued") {
       // cancelled/failed/completed IDs stay reusable (Q16): requeue the same session.
       this.resetDone(job);
@@ -95,12 +99,12 @@ export class SubagentManager {
   async cancel(id: string): Promise<Job | undefined> {
     const job = this.jobs.get(id);
     if (!job) return undefined;
-    (job as Job & { tasks: string[] }).tasks.length = 0;
+    job.tasks.length = 0;
     this.removeQueued(id);
     const wasRunning = job.status === "running";
     if (wasRunning) await job.session?.abort();
     job.status = "cancelled";
-    if (!wasRunning) (job as Job & { resolve: () => void }).resolve();
+    if (!wasRunning) job.resolve();
     this.emit(job, { type: "status" });
     return job;
   }
@@ -116,15 +120,15 @@ export class SubagentManager {
     for (const job of this.list()) job.session?.dispose();
   }
 
-  private makeJob(agent: AgentName, background: boolean): Job {
+  private makeJob(agent: AgentName, background: boolean, cwd: string, task: string): ManagedJob {
     let resolve!: () => void;
     const done = new Promise<void>((r) => { resolve = r; });
-    return { id: randomUUID(), agent, status: "queued", startedAt: Date.now(), background, done, ...({ resolve } as object) } as Job;
+    return { id: randomUUID(), agent, status: "queued", startedAt: Date.now(), background, done, cwd, tasks: [task], resolve };
   }
-  private resetDone(job: Job): void {
+  private resetDone(job: ManagedJob): void {
     let resolve!: () => void;
     job.done = new Promise<void>((r) => { resolve = r; });
-    (job as Job & { resolve: () => void }).resolve = resolve;
+    job.resolve = resolve;
   }
   private enqueue(id: string): void {
     const job = this.jobs.get(id)!;
@@ -143,15 +147,17 @@ export class SubagentManager {
       if (job.status !== "cancelled") void this.run(job);
     }
   }
-  private async run(job: Job): Promise<void> {
+  // Read status through a method so CFA does not narrow job.status to a
+  // literal after assignment — cancel() can mutate it across awaits.
+  private isCancelled(job: Job): boolean { return job.status === "cancelled"; }
+  private async run(job: ManagedJob): Promise<void> {
     this.running++;
     job.status = "running";
     this.emit(job, { type: "status" });
     try {
-      const internal = job as Job & { cwd: string; tasks: string[]; resolve: () => void };
-      if (!job.session) await this.createSession(job, internal.cwd);
-      while (internal.tasks.length && job.status !== "cancelled") {
-        const task = internal.tasks.shift()!;
+      if (!job.session) await this.createSession(job, job.cwd);
+      while (job.tasks.length && !this.isCancelled(job)) {
+        const task = job.tasks.shift()!;
         await new Promise<void>((resolve, reject) => {
           const off = job.session!.subscribe((event) => {
             this.forward(job, event);
@@ -160,14 +166,13 @@ export class SubagentManager {
           void job.session!.sendUserMessage(task).catch((error) => { off(); reject(error); });
         });
       }
-      if (job.status !== "cancelled") job.status = "completed";
+      if (!this.isCancelled(job)) job.status = "completed";
     } catch (error) {
-      if (job.status !== "cancelled") { job.status = "failed"; job.error = error instanceof Error ? error.message : String(error); }
+      if (!this.isCancelled(job)) { job.status = "failed"; job.error = error instanceof Error ? error.message : String(error); }
     } finally {
       this.running--;
       this.emit(job, { type: "status" });
-      const internal = job as Job & { tasks: string[]; resolve: () => void };
-      internal.resolve();
+      job.resolve();
       this.evictIdle();
       this.pump();
     }
@@ -189,7 +194,11 @@ export class SubagentManager {
       cwd, agentDir, noExtensions: true,
       noSkills: true, noPromptTemplates: true, noContextFiles: false,
       additionalSkillPaths: definition.skills ?? [], systemPrompt: definition.prompt,
-      extensionFactories: [omnirouteAuth as InlineExtension, magicContext as InlineExtension, createMcpExtension(job.agent)],
+      // Magic Context ships no type declarations (@cortexkit/pi-magic-context has
+      // no .d.ts); load it via additionalExtensionPaths so the package's own
+      // pi.extensions manifest entry is resolved at runtime by the loader.
+      additionalExtensionPaths: ["node_modules/@cortexkit/pi-magic-context"],
+      extensionFactories: [omnirouteAuth as InlineExtension, createMcpExtension(job.agent)],
     });
     await loader.reload();
     // Inline providers register when AgentSession binds the extension runtime.
@@ -212,13 +221,13 @@ export class SubagentManager {
         ` agentDir=${agentDir} (auth.json / models.json).`,
       );
     }
-    let model = modelId.length ? runtime.getModel(provider, modelId.join("/")) : undefined;
+    let model = provider && modelId.length ? runtime.getModel(provider, modelId.join("/")) : undefined;
     if (!model && modelId.length && provider) {
       // Native-provider registration kicks an async stored-models restore
       // (models-store.json); wait for it deterministically before resolving.
       // Surface refresh errors (provider, auth/models paths, configured
       // model) instead of swallowing them — errors never contain the key.
-      const refreshResult = await runtime.refresh({ providers: [provider], allowNetwork: false }).catch((error: unknown) => error);
+      const refreshResult = await runtime.refresh({ allowNetwork: false }).catch((error: unknown) => error);
       model = runtime.getModel(provider, modelId.join("/"));
       if (!model) {
         session.dispose();
@@ -241,31 +250,32 @@ export class SubagentManager {
     job.session = session; job.sessionId = session.sessionId; job.sessionFile = session.sessionFile ?? undefined;
   }
   private forward(job: Job, event: AgentSessionEvent): void {
-    const data = event as unknown as { type: string; assistantMessageEvent?: { type: string; delta?: string }; toolName?: string };
-    if (data.type === "message_update" && data.assistantMessageEvent?.delta) {
-      const type = data.assistantMessageEvent.type === "thinking_delta" ? "thinking" : data.assistantMessageEvent.type === "text_delta" ? "text" : undefined;
-      if (type) {
+    if (event.type === "message_update") {
+      const { assistantMessageEvent } = event;
+      if ((assistantMessageEvent.type === "text_delta" || assistantMessageEvent.type === "thinking_delta") && assistantMessageEvent.delta) {
+        const type = assistantMessageEvent.type === "text_delta" ? "text" : "thinking";
         // New assistant output supersedes any finished tool activity.
         job.lastTool = undefined;
         const activity = job.activity ??= [];
-        activity.push(data.assistantMessageEvent.delta);
+        activity.push(assistantMessageEvent.delta);
         if (activity.length > 200) activity.shift();
-        if (type === "text") { job.output = (job.output ?? "") + data.assistantMessageEvent.delta; job.responseText = job.output; }
-        this.emit(job, { type, text: data.assistantMessageEvent.delta });
+        if (type === "text") { job.output = (job.output ?? "") + assistantMessageEvent.delta; job.responseText = job.output; }
+        this.emit(job, { type, text: assistantMessageEvent.delta });
       }
     }
-    if (data.type === "tool_execution_start" || data.type === "tool_execution_end") {
-      if (data.type === "tool_execution_start") {
+    if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+      const toolName = event.toolName;
+      if (event.type === "tool_execution_start") {
         const activity = job.activity ??= [];
-        activity.push(`\n[tool] ${data.toolName ?? "unknown"}\n`);
+        activity.push(`\n[tool] ${toolName}\n`);
         if (activity.length > 200) activity.shift();
-        (job.activeTools ??= new Map()).set(`${data.toolName}_${Date.now()}`, data.toolName ?? "unknown");
-        job.lastTool = data.toolName ?? "unknown";
+        (job.activeTools ??= new Map()).set(`${toolName}_${Date.now()}`, toolName);
+        job.lastTool = toolName;
       } else {
         const tools = job.activeTools;
-        if (tools) for (const [key, name] of tools) { if (name === data.toolName) { tools.delete(key); break; } }
+        if (tools) for (const [key, name] of tools) { if (name === toolName) { tools.delete(key); break; } }
       }
-      this.emit(job, { type: data.type === "tool_execution_start" ? "tool_start" : "tool_end", tool: data.toolName });
+      this.emit(job, { type: event.type === "tool_execution_start" ? "tool_start" : "tool_end", tool: toolName });
     }
   }
   private emit(job: Job, event: JobEvent): void { for (const listener of this.listeners) listener(job, event); }

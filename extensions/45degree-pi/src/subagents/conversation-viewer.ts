@@ -6,10 +6,10 @@
  * Supports steering while running and a two-press stop confirmation.
  */
 
-import { type Component, type TUI, Input, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { Theme } from "@earendil-works/pi-coding-agent";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { Job, SubagentManager } from "./manager.ts";
+import {type Component, type TUI, Input, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi} from "@earendil-works/pi-tui";
+import {Theme} from "@earendil-works/pi-coding-agent";
+import type {ExtensionCommandContext} from "@earendil-works/pi-coding-agent";
+import type {Job, SubagentManager} from "./manager.ts";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
 const CHROME_LINES_BASE = 6;
@@ -32,12 +32,14 @@ export class ConversationViewer implements Component {
     private manager: SubagentManager,
     private ctx: ExtensionCommandContext,
     private theme: Theme,
-    private done: () => void,
+    private done: () => void
   ) {
-    this.unsubscribe = job.session?.subscribe(() => {
+    const unsub = job.session?.subscribe(() => {
       if (this.closed) return;
       this.tui.requestRender();
     });
+    // exactOptionalPropertyTypes: only assign when defined.
+    if (unsub) this.unsubscribe = unsub;
   }
 
   handleInput(data: string): void {
@@ -117,30 +119,21 @@ export class ConversationViewer implements Component {
       const vis = visibleWidth(s);
       return s + " ".repeat(Math.max(0, len - vis));
     };
-    const row = (content: string) =>
-      th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
+    const row = (content: string) => th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
     const hrTop = th.fg("border", `╭${"─".repeat(width - 2)}╮`);
     const hrBot = th.fg("border", `╰${"─".repeat(width - 2)}╯`);
     const hrMid = row(th.fg("dim", "─".repeat(innerW)));
 
     // Header
     lines.push(hrTop);
-    const statusIcon = this.job.status === "running"
-      ? th.fg("accent", "●")
-      : this.job.status === "completed"
-        ? th.fg("success", "✓")
-        : this.job.status === "failed"
-          ? th.fg("error", "✗")
-          : th.fg("dim", "○");
+    const statusIcon = this.job.status === "running" ? th.fg("accent", "●") : this.job.status === "completed" ? th.fg("success", "✓") : this.job.status === "failed" ? th.fg("error", "✗") : th.fg("dim", "○");
     const elapsed = formatElapsed(Date.now() - this.job.startedAt);
-    const taskDesc = ((this.job as Job & { tasks?: string[] }).tasks?.[0] ?? "").split("\n")[0]?.slice(0, 48) ?? "";
+    const taskDesc = ((this.job as Job & {tasks?: string[]}).tasks?.[0] ?? "").split("\n")[0]?.slice(0, 48) ?? "";
     const toolCount = this.job.activeTools?.size ?? 0;
     const headerParts: string[] = [elapsed];
     if (toolCount > 0) headerParts.unshift(`${toolCount} tool${toolCount === 1 ? "" : "s"}`);
     const headerRight = headerParts.join(" · ");
-    lines.push(row(
-      `${statusIcon} ${th.bold(this.job.agent)} ${th.fg("dim", `· ${taskDesc}`)} ${th.fg("dim", "·")} ${th.fg("dim", headerRight)}`,
-    ));
+    lines.push(row(`${statusIcon} ${th.bold(this.job.agent)} ${th.fg("dim", `· ${taskDesc}`)} ${th.fg("dim", "·")} ${th.fg("dim", headerRight)}`));
     lines.push(hrMid);
 
     // Content area — rebuild every render (live data, no cache needed)
@@ -178,14 +171,10 @@ export class ConversationViewer implements Component {
       }
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn · Esc close");
 
-      const scrollPct = contentLines.length <= viewportHeight
-        ? "100%"
-        : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
+      const scrollPct = contentLines.length <= viewportHeight ? "100%" : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
       const count = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
       const withCount = [count, ...actions].join(sep);
-      const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW
-        ? withCount
-        : actions.join(sep);
+      const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW ? withCount : actions.join(sep);
 
       const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
       lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
@@ -195,13 +184,15 @@ export class ConversationViewer implements Component {
     return lines;
   }
 
-  invalidate(): void { /* no cached state to clear */ }
+  invalidate(): void {
+    /* no cached state to clear */
+  }
 
   dispose(): void {
     this.closed = true;
     if (this.unsubscribe) {
       this.unsubscribe();
-      this.unsubscribe = undefined;
+      delete this.unsubscribe;
     }
   }
 
@@ -235,12 +226,12 @@ export class ConversationViewer implements Component {
     input.focused = true;
     input.onSubmit = (value: string) => {
       const message = value.trim();
-      this.composer = undefined;
+      delete this.composer;
       if (message) void this.doSteer(message);
       this.tui.requestRender();
     };
     input.onEscape = () => {
-      this.composer = undefined;
+      delete this.composer;
       this.tui.requestRender();
     };
     this.composer = input;
@@ -290,10 +281,10 @@ export class ConversationViewer implements Component {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
         const wrapped = wrapTextWithAnsi(text.trim(), width);
-        for (let wi = 0; wi < wrapped.length; wi++) lines.push(wrapped[wi]);
+        for (const line of wrapped) lines.push(line);
       } else if (role === "assistant") {
         const textParts: string[] = [];
-        const toolCalls: Array<{ name: string; args: string }> = [];
+        const toolCalls: Array<{name: string; args: string}> = [];
         const content = Array.isArray(msg.content) ? msg.content : [];
         for (let ci = 0; ci < content.length; ci++) {
           const c = content[ci];
@@ -309,20 +300,19 @@ export class ConversationViewer implements Component {
             }
             // Cap raw args so long payloads stay readable; wrapping handles the rest.
             if (args.length > 200) args = args.slice(0, 197) + "...";
-            toolCalls.push({ name, args });
+            toolCalls.push({name, args});
           }
         }
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
           const wrapped = wrapTextWithAnsi(textParts.join("\n").trim(), width);
-          for (let wi = 0; wi < wrapped.length; wi++) lines.push(wrapped[wi]);
+          for (const line of wrapped) lines.push(line);
         }
         // Tool calls: one blank line after assistant text, then one call per
         // line — `▍tool: input` — continuation lines aligned under the input.
         if (toolCalls.length > 0 && textParts.length > 0) lines.push("");
-        for (let ti = 0; ti < toolCalls.length; ti++) {
-          const tc = toolCalls[ti];
+        for (const tc of toolCalls) {
           const hasArgs = !!tc.args && tc.args !== "{}";
           if (hasArgs) {
             const prefix = `▍${tc.name}: `;
@@ -330,7 +320,7 @@ export class ConversationViewer implements Component {
             const wrapped = wrapTextWithAnsi(tc.args, Math.max(1, width - prefixW));
             lines.push(th.fg("muted", prefix + wrapped[0]));
             for (let wi = 1; wi < wrapped.length; wi++) {
-              lines.push(th.fg("muted", " ".repeat(prefixW) + wrapped[wi]));
+              lines.push(th.fg("muted", " ".repeat(prefixW) + (wrapped[wi] ?? "")));
             }
           } else {
             lines.push(th.fg("muted", `▍${tc.name}`));
@@ -346,7 +336,7 @@ export class ConversationViewer implements Component {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", `[${role}]`));
         const wrapped = wrapTextWithAnsi(text.trim(), width);
-        for (let wi = 0; wi < wrapped.length; wi++) lines.push(th.fg("dim", wrapped[wi]));
+        for (const line of wrapped) lines.push(th.fg("dim", line));
       }
       needsSeparator = true;
     }
@@ -361,8 +351,8 @@ export class ConversationViewer implements Component {
     }
 
     const out: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      out.push(truncateToWidth(lines[i], width));
+    for (const line of lines) {
+      out.push(truncateToWidth(line, width));
     }
     return out;
   }
@@ -385,9 +375,12 @@ export class ConversationViewer implements Component {
     if (text) {
       const all = text.split("\n");
       let line = "";
-      for (let i = 0; i < all.length; i++) {
-        const t = all[i].trim();
-        if (t) { line = t; break; }
+      for (const raw of all) {
+        const t = raw.trim();
+        if (t) {
+          line = t;
+          break;
+        }
       }
       return line.length > 60 ? line.slice(0, 57) + "…" : line;
     }
@@ -422,24 +415,23 @@ function extractContentText(content: unknown): string {
  * Open a full-session overlay for the given job.
  * Reuses the local SubagentManager for cancellation and Job.session for steering.
  */
-export async function openConversationViewer(
-  job: Job,
-  manager: SubagentManager,
-  ctx: ExtensionCommandContext,
-): Promise<void> {
-  await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-    const viewer = new ConversationViewer(tui, job, manager, ctx, theme, done);
-    return viewer;
-  }, {
-    overlay: true,
-    overlayOptions: {
-      width: "90%",
-      maxHeight: "85%",
-      anchor: "center",
-      margin: 1,
+export async function openConversationViewer(job: Job, manager: SubagentManager, ctx: ExtensionCommandContext): Promise<void> {
+  await ctx.ui.custom<void>(
+    (tui, theme, _keybindings, done) => {
+      const viewer = new ConversationViewer(tui, job, manager, ctx, theme, done);
+      return viewer;
     },
-    onHandle: (handle) => {
-      handle.focus();
-    },
-  });
+    {
+      overlay: true,
+      overlayOptions: {
+        width: "90%",
+        maxHeight: "85%",
+        anchor: "center",
+        margin: 1
+      },
+      onHandle: (handle) => {
+        handle.focus();
+      }
+    }
+  );
 }

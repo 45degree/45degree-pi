@@ -33,23 +33,36 @@ interface GuardState {
   nextId: number;
 }
 
-/** A registration token keeps its ExtensionAPI scope alive until finalization. */
-interface ScopedEntry extends Entry {
-  readonly scope: object;
+/**
+ * Typed accessor for the process-wide guard slot. The cast is confined to this
+ * single function; all other code reads/writes through peekState/ensureState.
+ */
+function globalSlot(): Record<symbol, unknown> {
+  return globalThis as Record<symbol, unknown>;
+}
+
+/**
+ * Runtime shape check so a corrupted slot is detected instead of trusted.
+ * Replaces the previous blind `as GuardState | undefined` assertion.
+ */
+function isGuardState(value: unknown): value is GuardState {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("current" in value) || !("nextId" in value)) return false;
+  return value.current instanceof WeakMap && typeof value.nextId === "number";
 }
 
 function peekState(): GuardState | undefined {
-  return (globalThis as Record<symbol, unknown>)[GUARD_SYM] as GuardState | undefined;
+  const value = globalSlot()[GUARD_SYM];
+  return isGuardState(value) ? value : undefined;
 }
 
 function ensureState(): GuardState {
-  const g = globalThis as Record<symbol, unknown>;
-  let s = g[GUARD_SYM] as GuardState | undefined;
-  if (s === undefined) {
-    s = { current: new WeakMap<object, Map<string, number>>(), nextId: 0 };
-    g[GUARD_SYM] = s;
-  }
-  return s;
+  const slot = globalSlot();
+  const existing = slot[GUARD_SYM];
+  if (isGuardState(existing)) return existing;
+  const created: GuardState = { current: new WeakMap<object, Map<string, number>>(), nextId: 0 };
+  slot[GUARD_SYM] = created;
+  return created;
 }
 
 /**
@@ -58,7 +71,7 @@ function ensureState(): GuardState {
  * registration with the same key is never evicted by an older token being
  * GC'd.
  */
-const REGISTRY = new FinalizationRegistry<ScopedEntry>((entry) => {
+const REGISTRY = new FinalizationRegistry<Entry>((entry) => {
   const registrations = peekState()?.current.get(entry.scope);
   if (registrations?.get(entry.key) === entry.id) {
     registrations.delete(entry.key);
@@ -95,7 +108,7 @@ export function registerInstance(scope: object, key: string, token: object): () 
   const registrations = s.current.get(scope) ?? new Map<string, number>();
   s.current.set(scope, registrations);
   registrations.set(key, id);
-  REGISTRY.register(token, { scope, key, id } satisfies ScopedEntry, token);
+  REGISTRY.register(token, { scope, key, id } satisfies Entry, token);
   return () => {
     const st = peekState();
     const current = st?.current.get(scope);
@@ -114,8 +127,7 @@ export function registerInstance(scope: object, key: string, token: object): () 
 
 /** Test-only: deterministically wipe all guard state from this runtime. */
 export function _resetGuardForTesting(): void {
-  const g = globalThis as Record<symbol, unknown>;
-  delete g[GUARD_SYM];
+  delete globalSlot()[GUARD_SYM];
 }
 
 /** Test-only: read-only snapshot of currently-registered keys. */
