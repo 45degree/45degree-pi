@@ -5,6 +5,8 @@ import {openConversationViewer} from "./conversation-viewer.ts";
 import {SubagentManager, type Job} from "./manager.ts";
 import {FleetPresenter} from "./fleet.ts";
 import {tasksParameters as parameters, tasksQueryParameters as queryParameters, tasksCancelParameters as cancelParameters} from "./task-schemas.ts";
+import {CodeGraphService} from "../codegraph/service.ts";
+import {config} from "../config.ts";
 
 const SUBAGENT_RESULT = "__45degree_subagent_result";
 const SUBAGENT_RESULT_RE = /^Background subagent finished:/;
@@ -17,7 +19,8 @@ function jobText(job: Job, includeActivity = false): string {
 }
 
 export default function setupSubagents(pi: ExtensionAPI): void {
-  const manager = new SubagentManager(agents);
+  const service = new CodeGraphService(config.codegraph.rootMarks);
+  const manager = new SubagentManager(agents, {}, service);
   const fleet = new FleetPresenter(pi, manager);
   manager.onEvent((job, event) => {
     if (event.type === "status" && job.background && ["completed", "failed", "cancelled"].includes(job.status)) {
@@ -37,6 +40,7 @@ export default function setupSubagents(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     fleet.dispose();
     await manager.shutdown();
+    await service.close();
   });
   pi.on("agent_end", async () => {
     await manager.waitForRunning();
@@ -65,6 +69,25 @@ export default function setupSubagents(pi: ExtensionAPI): void {
       });
       if (!selected) return;
       await openConversationViewer(selected, manager, ctx);
+    }
+  });
+
+  pi.registerCommand("codegraph-init", {
+    description: "Initialize the CodeGraph index for the current project (creates .codegraph/) and keep it watched",
+    handler: async (_args, ctx) => {
+      const statusKey = "codegraph";
+      ctx.ui.setStatus(statusKey, "Resolving project root...");
+      try {
+        await service.initialize(ctx.cwd, (p) => {
+          ctx.ui.setStatus(statusKey, `Indexing: ${p.phase} ${p.current}/${p.total}${p.currentFile ? ` · ${p.currentFile.slice(-48)}` : ""}`);
+        });
+        const root = await service.resolveRoot(ctx.cwd);
+        ctx.ui.setStatus(statusKey, undefined);
+        ctx.ui.notify(`CodeGraph index ready: ${root}`, "info");
+      } catch (error) {
+        ctx.ui.setStatus(statusKey, undefined);
+        ctx.ui.notify(`CodeGraph init failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
     }
   });
 

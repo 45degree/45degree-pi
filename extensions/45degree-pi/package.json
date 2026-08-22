@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@cortexkit/pi-magic-context": "^0.38.0",
+    "@colbymchenry/codegraph": "^1.5.0",
+    "@cortexkit/pi-magic-context": "^0.38.1",
     "pi-mcp-adapter": "^2.26.1"
   },
   "peerDependencies": {

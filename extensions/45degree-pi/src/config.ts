@@ -19,6 +19,11 @@ export interface AgentOverrides {
   model?: string;
 }
 
+/** CodeGraph root discovery marks, checked while scanning upward. */
+export interface CodeGraphConfig {
+  readonly rootMarks: readonly string[];
+}
+
 /** Typed shape of the static config object declared below. */
 export interface ExtensionConfig {
   readonly mcp: {
@@ -26,6 +31,7 @@ export interface ExtensionConfig {
     readonly agents: Partial<Record<AgentName, readonly string[]>>;
   };
   readonly agents: Partial<Record<AgentName, AgentOverrides>>;
+  readonly codegraph: CodeGraphConfig;
 }
 
 export const config: ExtensionConfig = {
@@ -41,5 +47,8 @@ export const config: ExtensionConfig = {
     observer: { model: "omniroute/omos-observer" },
     oracle: { skills: [], model: "omniroute/omos-oracle" },
     fixer: { model: "omniroute/omos-fixer" },
+  },
+  codegraph: {
+    rootMarks: [".codegraph", ".git"],
   },
 };

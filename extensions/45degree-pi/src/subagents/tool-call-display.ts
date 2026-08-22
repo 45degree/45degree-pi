@@ -1,12 +1,12 @@
 // Single-line, <=80-char rendering of a tool call for UI rows.
 
-const PATH_TOOLS = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+const ARGUMENT_TOOLS = new Set(["bash", "read", "grep", "find", "ls", "edit", "write"]);
 
 export function formatToolCall(name: string, input: unknown): string {
   let detail: string | undefined;
   if (typeof input === "object" && input !== null) {
     const record = input as Record<string, unknown>;
-    const key = name === "bash" ? "command" : PATH_TOOLS.has(name) ? "path" : undefined;
+    const key = !ARGUMENT_TOOLS.has(name) ? undefined : name === "bash" ? "command" : "path";
     const value = key ? record[key] : undefined;
     if (typeof value === "string") detail = value;
   }

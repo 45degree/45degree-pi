@@ -5,6 +5,8 @@ import {join} from "node:path";
 import {createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSession, type AgentSessionEvent, type ExtensionAPI, type InlineExtension} from "@earendil-works/pi-coding-agent";
 import omnirouteAuth from "../omniroute/auth.ts";
 import createMcpExtension from "../mcp.ts";
+import {CodeGraphService} from "../codegraph/service.ts";
+import {createCodeGraphExtension} from "../codegraph/tools.ts";
 import type {AgentDefinition, AgentName} from "./agents.ts";
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -94,7 +96,8 @@ export class SubagentManager {
 
   constructor(
     private readonly definitions: Record<AgentName, AgentDefinition>,
-    policy: Partial<ManagerPolicy> = {}
+    policy: Partial<ManagerPolicy> = {},
+    private readonly codeGraph: CodeGraphService | undefined = undefined
   ) {
     this.policy = {...defaultPolicy, ...policy};
     mkdirSync(this.sessionDir, {recursive: true});
@@ -267,6 +270,9 @@ export class SubagentManager {
       authPath: join(agentDir, "auth.json"),
       modelsPath: join(agentDir, "models.json")
     });
+    // Inject CodeGraph tools only when the cwd's root has an index; get()
+    // opens + watches it, so a ready graph also populates the service cache.
+    const codeGraphExtension = this.codeGraph && (await this.codeGraph.get(cwd)) ? createCodeGraphExtension(this.codeGraph, cwd) : undefined;
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir,
@@ -283,6 +289,7 @@ export class SubagentManager {
       extensionFactories: [
         omnirouteAuth as InlineExtension,
         createMcpExtension(job.agent),
+        ...(codeGraphExtension ? [codeGraphExtension] : []),
         // Track the in-flight tool call on the job (closure over `job`);
         // forward() clears it on the matching tool_execution_end.
         (pi: ExtensionAPI) => {
@@ -301,7 +308,7 @@ export class SubagentManager {
       agentDir,
       modelRuntime: runtime,
       thinkingLevel: definition.thinking,
-      tools: definition.tools,
+      tools: [...definition.tools, ...(codeGraphExtension ? ["codegraph_explore", "codegraph_callers", "codegraph_callees", "codegraph_impact"] : [])],
       excludeTools: ["subagent", "ctx_memory"],
       resourceLoader: loader,
       sessionManager: SessionManager.create(cwd, this.sessionDir)
