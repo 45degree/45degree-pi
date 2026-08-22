@@ -1,149 +1,25 @@
-import {type ExtensionAPI, type ExtensionUIContext} from "@earendil-works/pi-coding-agent";
+import {getMarkdownTheme, type ExtensionAPI} from "@earendil-works/pi-coding-agent";
 import {Container, Markdown, SelectList, Text} from "@earendil-works/pi-tui";
-import {Type} from "typebox";
 import {agentDirectory, agents, isAgentName} from "./agents.ts";
 import {openConversationViewer} from "./conversation-viewer.ts";
 import {SubagentManager, type Job} from "./manager.ts";
+import {FleetPresenter} from "./fleet.ts";
+import {tasksParameters as parameters, tasksQueryParameters as queryParameters, tasksCancelParameters as cancelParameters} from "./task-schemas.ts";
 
-const action = Type.Optional(Type.Union([Type.Literal("start"), Type.Literal("cancel")]));
-const parameters = Type.Object({action, agent: Type.Optional(Type.String()), title: Type.Optional(Type.String()), task: Type.Optional(Type.String()), async: Type.Optional(Type.Boolean()), task_id: Type.Optional(Type.String())});
-const queryParameters = Type.Object({action: Type.Union([Type.Literal("status"), Type.Literal("result"), Type.Literal("session")]), task_id: Type.String()});
 const SUBAGENT_RESULT = "__45degree_subagent_result";
 const SUBAGENT_RESULT_RE = /^Background subagent finished:/;
 const SUBAGENT_QUERY = "__45degree_subagent_query";
-const STATUS_ID = "45degree-subagents";
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const TOOL_ACTIVITY: Record<string, string> = {read: "reading", bash: "running command", edit: "editing", write: "writing", grep: "searching", find: "finding files", ls: "listing"};
-const MAX_WIDGET_LINES = 12;
-// Per-setup mutable runtime state: each setupSubagents(pi) call creates one
-// controller so concurrent/reloaded extension instances never share state.
-type FleetController = {
-  ui: ExtensionUIContext | undefined;
-  spinnerFrame: number;
-  widgetTimer: ReturnType<typeof setInterval> | undefined;
-  lastStatus: string | undefined;
-  fleetWidget: {tui: {requestRender(): void}} | undefined;
-};
 
-function toolActivity(job: Job): string {
-  // tintinweb pi-subagents describeActivity: running tools first, grouped;
-  // otherwise truncated response text; otherwise thinking…
-  const tools = job.activeTools;
-  if (tools && tools.size > 0) {
-    const groups = new Map<string, number>();
-    for (const name of tools.values()) {
-      const action = TOOL_ACTIVITY[name] ?? name;
-      groups.set(action, (groups.get(action) ?? 0) + 1);
-    }
-    const parts: string[] = [];
-    for (const [action, count] of groups) parts.push(count > 1 ? `${action} ${count} ${action === "searching" ? "patterns" : "files"}` : action);
-    return parts.join(", ") + "…";
-  }
-  // A just-finished tool still describes current activity better than stale
-  // response text — the model usually pauses between tool end and next output.
-  if (job.lastTool) {
-    const action = TOOL_ACTIVITY[job.lastTool] ?? job.lastTool;
-    return `${action} done`;
-  }
-  const text = job.responseText?.trim();
-  if (text) {
-    const line =
-      text
-        .split("\n")
-        .find((l) => l.trim())
-        ?.trim() ?? "";
-    if (line) return line.length > 60 ? line.slice(0, 57) + "…" : line;
-  }
-  return "thinking…";
-}
-function formatElapsed(ms: number): string {
-  const s = ms / 1000;
-  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m${Math.round(s % 60)}s`;
-}
-function fleetRow(frame: number, job: Job, isLast: boolean, theme: {fg(c: string, t: string): string; bold(t: string): string}): string[] {
-  const branch = isLast ? "└─" : "├─";
-  const guide = isLast ? "   " : "│  ";
-  // Description: first line of the latest task text.
-  const task = (job as Job & {tasks?: string[]}).tasks?.[0] ?? "";
-  const desc = task.split("\n")[0]?.slice(0, 48) ?? "";
-  // Fixed-width elapsed so ticking digits never re-flow the line.
-  const stats = formatElapsed(Date.now() - job.startedAt).padStart(6, " ");
-  return [`${theme.fg("dim", branch)} ${theme.fg("accent", SPINNER[frame] ?? "⠋")} ${theme.bold(job.agent.padEnd(9))} ${theme.fg("muted", desc)} ${theme.fg("dim", "· " + stats)}`, `${theme.fg("dim", guide + "└ " + toolActivity(job))}`];
-}
-function renderFleet(ctl: FleetController, manager: SubagentManager): void {
-  const visible = manager.list().filter((job) => job.status === "running");
-  if (!visible.length) {
-    if (ctl.fleetWidget) {
-      ctl.ui?.setWidget("45degree-fleet", undefined);
-      ctl.fleetWidget = undefined;
-    }
-    if (ctl.widgetTimer) {
-      clearInterval(ctl.widgetTimer);
-      ctl.widgetTimer = undefined;
-    }
-    return;
-  }
-  if (!ctl.fleetWidget) {
-    ctl.ui?.setWidget(
-      "45degree-fleet",
-      (tui, theme) => {
-        ctl.fleetWidget = {tui};
-        // invalidate/dispose are no-ops: the 200ms timer keeps rendering via
-        // requestRender; clearing fleetWidget here would make the timer
-        // re-register the widget every tick (flicker). Only renderFleet's
-        // no-running-jobs branch and session_shutdown clear it.
-        return {
-          render: (width: number) => {
-            const running = manager.list().filter((job) => job.status === "running");
-            const lines: string[] = [`${theme.fg("accent", "●")} ${theme.bold("Agents")}`];
-            const entries = running.flatMap((job, i) => fleetRow(ctl.spinnerFrame, job, i === running.length - 1, theme));
-            const capacity = MAX_WIDGET_LINES - lines.length;
-            const shown = entries.length > capacity ? Math.max(0, capacity - 1) : capacity;
-            lines.push(...entries.slice(0, shown));
-            if (entries.length > shown) lines.push(theme.fg("dim", `└─ +${entries.length - shown} more`));
-            return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((part) => (part.length > width ? part.slice(0, width) : part)));
-          },
-          invalidate: () => {},
-          dispose: () => {}
-        };
-      },
-      {placement: "aboveEditor"}
-    );
-    if (!ctl.widgetTimer)
-      ctl.widgetTimer = setInterval(() => {
-        ctl.spinnerFrame = (ctl.spinnerFrame + 1) % SPINNER.length;
-        renderFleet(ctl, manager);
-      }, 200);
-  } else ctl.fleetWidget.tui.requestRender();
-}
 function jobText(job: Job, includeActivity = false): string {
   const elapsed = `${((Date.now() - job.startedAt) / 1000).toFixed(1)}s`;
   const result = job.output || (includeActivity ? job.activity?.join("") : undefined) || job.error || (job.status === "completed" ? "No text result." : "Still running.");
   return `${job.agent} · ${job.status} · ${elapsed}\nid: ${job.id}\nsessionId: ${job.sessionId ?? "pending"}\nsessionFile: ${job.sessionFile ?? "pending"}\n\n${result}`;
 }
-function isActive(job: Job): boolean {
-  return job.status === "queued" || job.status === "running";
-}
-function updateStatus(ctl: FleetController, manager: SubagentManager): void {
-  const active = manager.list().filter(isActive);
-  const running = active.filter((j) => j.status === "running").length;
-  const queued = active.length - running;
-  const parts: string[] = [];
-  if (running) parts.push(`${running} running`);
-  if (queued) parts.push(`${queued} queued`);
-  const next = parts.length ? `${parts.join(", ")} agent${active.length === 1 ? "" : "s"}` : undefined;
-  if (next !== ctl.lastStatus) {
-    ctl.ui?.setStatus(STATUS_ID, next);
-    ctl.lastStatus = next;
-  }
-}
 
 export default function setupSubagents(pi: ExtensionAPI): void {
   const manager = new SubagentManager(agents);
-  const ctl: FleetController = {ui: undefined, spinnerFrame: 0, widgetTimer: undefined, lastStatus: undefined, fleetWidget: undefined};
+  const fleet = new FleetPresenter(pi, manager);
   manager.onEvent((job, event) => {
-    updateStatus(ctl, manager);
-    renderFleet(ctl, manager);
     if (event.type === "status" && job.background && ["completed", "failed", "cancelled"].includes(job.status)) {
       const icon = job.status === "completed" ? "✓" : "✗";
       const first = (job.output ?? job.error ?? "No output.").split("\n")[0]?.slice(0, 80) ?? "";
@@ -158,18 +34,8 @@ export default function setupSubagents(pi: ExtensionAPI): void {
     return container;
   });
 
-  pi.on("session_start", (_event, ctx) => {
-    ctl.ui = ctx.ui;
-  });
   pi.on("session_shutdown", async () => {
-    if (ctl.widgetTimer) {
-      clearInterval(ctl.widgetTimer);
-      ctl.widgetTimer = undefined;
-    }
-    ctl.ui?.setWidget("45degree-fleet", undefined);
-    ctl.fleetWidget = undefined;
-    ctl.ui?.setStatus(STATUS_ID, undefined);
-    ctl.lastStatus = undefined;
+    fleet.dispose();
     await manager.shutdown();
   });
   pi.on("agent_end", async () => {
@@ -205,27 +71,21 @@ export default function setupSubagents(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "tasks",
     label: "Tasks",
-    description: "Delegate a focused task. Supply {agent, title, task} to create a new task, or {task_id, task} to continue it. Use action: cancel with task_id to cancel. Use tasks_query for status, result, or session.",
+    description: "Delegate a focused task. Supply {agent, title, task} to create a new task, or {task_id, task} to continue it. Use tasks_query for status, result, or session, and tasks_cancel with task_id to cancel.",
     parameters,
-    renderCall(args, _theme, _context) {
+    renderCall(args, theme, _context) {
       const existing = args.task_id ? manager.get(args.task_id) : undefined;
       const agent = args.agent ?? existing?.agent;
       const title = args.title ?? existing?.title;
       if (!title || !agent) return new Text("", 0, 0);
-      return new Text(`**[${agent}]**: ${title}`, 0, 0);
+      return new Markdown(`**[${agent}]**: ${title}`, 0, 0, {
+        ...getMarkdownTheme(),
+        bold: (text) => theme.fg("toolTitle", theme.bold(text))
+      });
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (signal?.aborted) throw new Error("Task request aborted");
-      const input = params as {action?: string; agent?: string; title?: string; task?: string; async?: boolean; task_id?: string};
-      if (input.action === "cancel") {
-        if (!input.task_id) throw new Error("task_id is required for this action");
-        const job =
-          (await manager.cancel(input.task_id)) ??
-          (() => {
-            throw new Error(`Unknown task id: ${input.task_id}`);
-          })();
-        return {content: [{type: "text", text: jobText(job)}], details: undefined};
-      }
+      const input = params as {agent?: string; title?: string; task?: string; async?: boolean; task_id?: string};
       if (!input.task) throw new Error("task is required");
       let job: Job;
       if (!input.agent && input.task_id) job = manager.append(input.task_id, input.task);
@@ -234,7 +94,7 @@ export default function setupSubagents(pi: ExtensionAPI): void {
         if (!input.title) throw new Error("title is required for new tasks");
         job = manager.start(input.agent, input.task, ctx.cwd, input.title, input.async === true);
       }
-      if (input.async) return {content: [{type: "text", text: "Started background task."}], details: undefined};
+      if (input.async) return {content: [], details: undefined};
       await job.done;
       onUpdate?.({content: [{type: "text", text: jobText(job)}], details: undefined});
       return {content: [{type: "text", text: jobText(job)}], details: undefined};
@@ -264,6 +124,31 @@ export default function setupSubagents(pi: ExtensionAPI): void {
         .map((item) => item.text)
         .join("\n");
       return new Text(context.isError ? output : "", 0, 0);
+    }
+  });
+
+  pi.registerTool({
+    name: "tasks_cancel",
+    label: "Tasks cancel",
+    description: "Cancel a task by id. Supply {task_id}. Use tasks_query to inspect existing work first.",
+    parameters: cancelParameters,
+    renderCall(args, theme, _context) {
+      const job = args.task_id ? manager.get(args.task_id) : undefined;
+      if (!job?.title || !job.agent) return new Text("", 0, 0);
+      return new Markdown(`**[${job.agent}]**: ${job.title}`, 0, 0, {
+        ...getMarkdownTheme(),
+        bold: (text) => theme.fg("toolTitle", theme.bold(text))
+      });
+    },
+    async execute(_toolCallId, params, signal) {
+      if (signal?.aborted) throw new Error("Task cancel aborted");
+      const input = params as {task_id: string};
+      const job =
+        (await manager.cancel(input.task_id)) ??
+        (() => {
+          throw new Error(`Unknown task id: ${input.task_id}`);
+        })();
+      return {content: [{type: "text", text: jobText(job)}], details: undefined};
     }
   });
 }

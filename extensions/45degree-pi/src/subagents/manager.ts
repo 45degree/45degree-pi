@@ -2,17 +2,19 @@ import {randomUUID} from "node:crypto";
 import {mkdirSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSession, type AgentSessionEvent, type InlineExtension} from "@earendil-works/pi-coding-agent";
+import {createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSession, type AgentSessionEvent, type ExtensionAPI, type InlineExtension} from "@earendil-works/pi-coding-agent";
 import omnirouteAuth from "../omniroute/auth.ts";
 import createMcpExtension from "../mcp.ts";
 import type {AgentDefinition, AgentName} from "./agents.ts";
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
 export interface JobEvent {
   type: "text" | "thinking" | "tool_start" | "tool_end" | "status";
   text?: string;
   tool?: string;
 }
+
 export interface Job {
   id: string;
   agent: AgentName;
@@ -35,17 +37,46 @@ export interface Job {
   /** Most recent tool (set on start, kept after end); cleared on next text/thinking delta. */
   lastTool?: string | undefined;
   responseText?: string;
+  /** In-flight tool call observed by the tool_call extension hook. */
+  activeTool?: ActiveTool | undefined;
 }
+
+/** A tool call as reported by the tool_call extension hook, before execution. */
+export interface ActiveTool {
+  readonly id: string;
+  readonly name: string;
+  readonly input: unknown;
+}
+
+/**
+ * Immutable snapshot view of a job for UI consumers (fleet widget). Strict
+ * field set; activeTool/responseText mirror live job state, never exposed as
+ * raw job state.
+ */
+export interface TaskSnapshot {
+  readonly id: string;
+  readonly agent: AgentName;
+  readonly title: string;
+  readonly status: JobStatus;
+  readonly startedAt: number;
+  /** In-flight tool call, if any. */
+  readonly activeTool?: ActiveTool;
+  /** Accumulated assistant text output, if any. */
+  readonly responseText?: string;
+}
+
 /** Manager-private runtime state; extends the public Job but is never part of its API. */
 interface ManagedJob extends Job {
   cwd: string;
   tasks: string[];
   resolve: () => void;
 }
+
 export interface ManagerPolicy {
   concurrency: () => number;
   maxSessions: () => number;
 }
+
 const defaultPolicy: ManagerPolicy = {
   concurrency: () => Math.min(8, Math.max(1, Number(process.env.PI_45DEGREE_SUBAGENT_CONCURRENCY) || 4)),
   maxSessions: () => 50
@@ -55,6 +86,7 @@ export class SubagentManager {
   private readonly jobs = new Map<string, ManagedJob>();
   private readonly queues = new Map<string, string[]>();
   private readonly listeners = new Set<(job: Job, event: JobEvent) => void>();
+  private readonly snapshotListeners = new Set<(snapshots: readonly TaskSnapshot[]) => void>();
   private readonly sessionDir = join(tmpdir(), "45degree-pi-subagents");
   private running = 0;
   private shuttingDown = false;
@@ -72,9 +104,18 @@ export class SubagentManager {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+
+  /** Subscribe to immutable snapshot views of all jobs. The listener is invoked immediately with the current snapshots, then after every status/activity change. Returns an unsubscribe function. */
+  subscribeSnapshots(listener: (snapshots: readonly TaskSnapshot[]) => void): () => void {
+    this.snapshotListeners.add(listener);
+    listener(this.snapshots());
+    return () => this.snapshotListeners.delete(listener);
+  }
+
   list(): Job[] {
     return [...this.jobs.values()];
   }
+
   get(id: string): Job | undefined {
     return this.jobs.get(id);
   }
@@ -82,6 +123,9 @@ export class SubagentManager {
   start(agent: AgentName, task: string, cwd: string, title: string, background = false): Job {
     const job = this.makeJob(agent, background, cwd, task, title);
     this.jobs.set(job.id, job);
+    // Push a snapshot immediately so UI sees the new job even when it stays
+    // queued behind the concurrency limit.
+    this.broadcastSnapshots();
     this.enqueue(job.id);
     return job;
   }
@@ -121,6 +165,7 @@ export class SubagentManager {
         .map((job) => job.done)
     );
   }
+
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     await Promise.all(this.list().map((job) => this.cancel(job.id)));
@@ -135,6 +180,7 @@ export class SubagentManager {
     });
     return {id: randomUUID(), agent, title, status: "queued", startedAt: Date.now(), background, done, cwd, tasks: [task], resolve};
   }
+
   private resetDone(job: ManagedJob): void {
     let resolve!: () => void;
     job.done = new Promise<void>((r) => {
@@ -142,6 +188,7 @@ export class SubagentManager {
     });
     job.resolve = resolve;
   }
+
   private enqueue(id: string): void {
     const job = this.jobs.get(id)!;
     const queue = this.queues.get(id) ?? [];
@@ -149,9 +196,11 @@ export class SubagentManager {
     this.queues.set(id, queue);
     this.pump();
   }
+
   private removeQueued(id: string): void {
     this.queues.delete(id);
   }
+
   private pump(): void {
     while (!this.shuttingDown && this.running < this.policy.concurrency()) {
       const id = [...this.queues.keys()].find((key) => this.queues.get(key)?.length);
@@ -161,11 +210,13 @@ export class SubagentManager {
       if (job.status !== "cancelled") void this.run(job);
     }
   }
+
   // Read status through a method so CFA does not narrow job.status to a
   // literal after assignment — cancel() can mutate it across awaits.
   private isCancelled(job: Job): boolean {
     return job.status === "cancelled";
   }
+
   private async run(job: ManagedJob): Promise<void> {
     this.running++;
     job.status = "running";
@@ -202,6 +253,7 @@ export class SubagentManager {
       this.pump();
     }
   }
+
   private async createSession(job: Job, cwd: string): Promise<void> {
     this.evictIdle();
     const definition = this.definitions[job.agent];
@@ -228,7 +280,17 @@ export class SubagentManager {
       // no .d.ts); load it via additionalExtensionPaths so the package's own
       // pi.extensions manifest entry is resolved at runtime by the loader.
       additionalExtensionPaths: ["node_modules/@cortexkit/pi-magic-context"],
-      extensionFactories: [omnirouteAuth as InlineExtension, createMcpExtension(job.agent)]
+      extensionFactories: [
+        omnirouteAuth as InlineExtension,
+        createMcpExtension(job.agent),
+        // Track the in-flight tool call on the job (closure over `job`);
+        // forward() clears it on the matching tool_execution_end.
+        (pi: ExtensionAPI) => {
+          pi.on("tool_call", (event) => {
+            job.activeTool = {id: event.toolCallId, name: event.toolName, input: event.input};
+          });
+        }
+      ]
     });
     await loader.reload();
     // Inline providers register when AgentSession binds the extension runtime.
@@ -281,13 +343,15 @@ export class SubagentManager {
     job.sessionId = session.sessionId;
     job.sessionFile = session.sessionFile ?? undefined;
   }
+
   private forward(job: Job, event: AgentSessionEvent): void {
     if (event.type === "message_update") {
       const {assistantMessageEvent} = event;
       if ((assistantMessageEvent.type === "text_delta" || assistantMessageEvent.type === "thinking_delta") && assistantMessageEvent.delta) {
         const type = assistantMessageEvent.type === "text_delta" ? "text" : "thinking";
-        // New assistant output supersedes any finished tool activity.
+        // New assistant output supersedes any in-flight/finished tool state.
         job.lastTool = undefined;
+        job.activeTool = undefined;
         const activity = (job.activity ??= []);
         activity.push(assistantMessageEvent.delta);
         if (activity.length > 200) activity.shift();
@@ -299,29 +363,46 @@ export class SubagentManager {
       }
     }
     if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
-      const toolName = event.toolName;
+      const {toolName, toolCallId} = event;
+      // Maintain execution state only: track in-flight tools by unique
+      // toolCallId (never by name — same-name tools may overlap).
       if (event.type === "tool_execution_start") {
-        const activity = (job.activity ??= []);
-        activity.push(`\n[tool] ${toolName}\n`);
-        if (activity.length > 200) activity.shift();
-        (job.activeTools ??= new Map()).set(`${toolName}_${Date.now()}`, toolName);
-        job.lastTool = toolName;
+        (job.activeTools ??= new Map()).set(toolCallId, toolName);
       } else {
-        const tools = job.activeTools;
-        if (tools)
-          for (const [key, name] of tools) {
-            if (name === toolName) {
-              tools.delete(key);
-              break;
-            }
-          }
+        job.activeTools?.delete(toolCallId);
+        if (job.activeTool?.id === toolCallId) job.activeTool = undefined;
       }
       this.emit(job, {type: event.type === "tool_execution_start" ? "tool_start" : "tool_end", tool: toolName});
     }
   }
+
   private emit(job: Job, event: JobEvent): void {
     for (const listener of this.listeners) listener(job, event);
+    // Every event type (text/thinking/tool_start/tool_end/status) mutates
+    // activity or status, so each emit is a snapshot push.
+    this.broadcastSnapshots();
   }
+
+  private broadcastSnapshots(): void {
+    if (this.snapshotListeners.size > 0) {
+      const snapshots = this.snapshots();
+      for (const listener of this.snapshotListeners) listener(snapshots);
+    }
+  }
+
+  // Fresh objects every push: callers can never mutate manager state.
+  private snapshots(): TaskSnapshot[] {
+    return [...this.jobs.values()].map((job) => ({
+      id: job.id,
+      agent: job.agent,
+      title: job.title,
+      status: job.status,
+      startedAt: job.startedAt,
+      ...(job.activeTool ? {activeTool: job.activeTool} : {}),
+      ...(job.responseText ? {responseText: job.responseText} : {})
+    }));
+  }
+
   private evictIdle(): void {
     const idle = this.list()
       .filter((job) => job.status !== "running" && job.status !== "queued" && job.session)
