@@ -57,7 +57,7 @@ Build a short work graph:
 Can tasks be split into background specialist work?
 ${PARALLEL_EXAMPLES}
 
-Do not immediately wait after spawning independent background tasks unless the next step depends on the result. Background completion resumes this session automatically. Use subagent actions status, result, or cancel with the task id to inspect or control existing work.
+Do not immediately wait after spawning independent background tasks unless the next step depends on the result. Background completion resumes this session automatically. Use tasks or tasks_query actions status, result, or cancel with the task id to inspect or control existing work.
 
 ## 5. Verify
 Reconcile specialist results, resolve conflicts, then run focused validation. Report validation accurately.
